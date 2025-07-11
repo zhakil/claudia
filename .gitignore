@@ -11,6 +11,10 @@ node_modules
 dist
 dist-ssr
 *.local
+*.bun-build
+
+# Tauri binaries (built executables)
+src-tauri/binaries/
 
 # Editor directories and files
 .vscode/*
@@ -25,3 +29,9 @@ dist-ssr
 temp_lib/
 
 .cursor/
+AGENTS.md
+CLAUDE.md
+*_TASK.md
+
+# Claude project-specific files
+.claude/

@@ -1,4 +1,21 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { HooksConfiguration } from '@/types/hooks';
+
+/** Process type for tracking in ProcessRegistry */
+export type ProcessType = 
+  | { AgentRun: { agent_id: number; agent_name: string } }
+  | { ClaudeSession: { session_id: string } };
+
+/** Information about a running process */
+export interface ProcessInfo {
+  run_id: number;
+  process_type: ProcessType;
+  pid: number;
+  started_at: string;
+  project_path: string;
+  task: string;
+  model: string;
+}
 
 /**
  * Represents a project in the ~/.claude/projects directory
@@ -82,89 +99,14 @@ export interface FileEntry {
  * Represents a Claude installation found on the system
  */
 export interface ClaudeInstallation {
-  /** Full path to the Claude binary */
+  /** Full path to the Claude binary (or "claude-code" for sidecar) */
   path: string;
   /** Version string if available */
   version?: string;
-  /** Source of discovery (e.g., "nvm", "system", "homebrew", "which") */
+  /** Source of discovery (e.g., "nvm", "system", "homebrew", "which", "bundled") */
   source: string;
-}
-
-// Sandbox API types
-export interface SandboxProfile {
-  id?: number;
-  name: string;
-  description?: string;
-  is_active: boolean;
-  is_default: boolean;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface SandboxRule {
-  id?: number;
-  profile_id: number;
-  operation_type: string;
-  pattern_type: string;
-  pattern_value: string;
-  enabled: boolean;
-  platform_support?: string;
-  created_at: string;
-}
-
-export interface PlatformCapabilities {
-  os: string;
-  sandboxing_supported: boolean;
-  operations: OperationSupport[];
-  notes: string[];
-}
-
-export interface OperationSupport {
-  operation: string;
-  support_level: string;
-  description: string;
-}
-
-// Sandbox violation types
-export interface SandboxViolation {
-  id?: number;
-  profile_id?: number;
-  agent_id?: number;
-  agent_run_id?: number;
-  operation_type: string;
-  pattern_value?: string;
-  process_name?: string;
-  pid?: number;
-  denied_at: string;
-}
-
-export interface SandboxViolationStats {
-  total: number;
-  recent_24h: number;
-  by_operation: Array<{
-    operation: string;
-    count: number;
-  }>;
-}
-
-// Import/Export types
-export interface SandboxProfileExport {
-  version: number;
-  exported_at: string;
-  platform: string;
-  profiles: SandboxProfileWithRules[];
-}
-
-export interface SandboxProfileWithRules {
-  profile: SandboxProfile;
-  rules: SandboxRule[];
-}
-
-export interface ImportResult {
-  profile_name: string;
-  imported: boolean;
-  reason?: string;
-  new_name?: string;
+  /** Type of installation */
+  installation_type: "Bundled" | "System" | "Custom";
 }
 
 // Agent API types
@@ -175,10 +117,7 @@ export interface Agent {
   system_prompt: string;
   default_task?: string;
   model: string;
-  sandbox_enabled: boolean;
-  enable_file_read: boolean;
-  enable_file_write: boolean;
-  enable_network: boolean;
+  hooks?: string; // JSON string of HooksConfiguration
   created_at: string;
   updated_at: string;
 }
@@ -192,10 +131,7 @@ export interface AgentExport {
     system_prompt: string;
     default_task?: string;
     model: string;
-    sandbox_enabled: boolean;
-    enable_file_read: boolean;
-    enable_file_write: boolean;
-    enable_network: boolean;
+    hooks?: string;
   };
 }
 
@@ -445,6 +381,36 @@ export interface MCPServerConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+}
+
+/**
+ * Represents a custom slash command
+ */
+export interface SlashCommand {
+  /** Unique identifier for the command */
+  id: string;
+  /** Command name (without prefix) */
+  name: string;
+  /** Full command with prefix (e.g., "/project:optimize") */
+  full_command: string;
+  /** Command scope: "project" or "user" */
+  scope: string;
+  /** Optional namespace (e.g., "frontend" in "/project:frontend:component") */
+  namespace?: string;
+  /** Path to the markdown file */
+  file_path: string;
+  /** Command content (markdown body) */
+  content: string;
+  /** Optional description from frontmatter */
+  description?: string;
+  /** Allowed tools from frontmatter */
+  allowed_tools: string[];
+  /** Whether the command has bash commands (!) */
+  has_bash_commands: boolean;
+  /** Whether the command has file references (@) */
+  has_file_references: boolean;
+  /** Whether the command uses $ARGUMENTS placeholder */
+  accepts_arguments: boolean;
 }
 
 /**
@@ -702,10 +668,7 @@ export const api = {
    * @param system_prompt - The system prompt for the agent
    * @param default_task - Optional default task
    * @param model - Optional model (defaults to 'sonnet')
-   * @param sandbox_enabled - Optional sandbox enable flag
-   * @param enable_file_read - Optional file read permission
-   * @param enable_file_write - Optional file write permission
-   * @param enable_network - Optional network permission
+   * @param hooks - Optional hooks configuration as JSON string
    * @returns Promise resolving to the created agent
    */
   async createAgent(
@@ -713,11 +676,8 @@ export const api = {
     icon: string, 
     system_prompt: string, 
     default_task?: string, 
-    model?: string, 
-    sandbox_enabled?: boolean,
-    enable_file_read?: boolean,
-    enable_file_write?: boolean,
-    enable_network?: boolean
+    model?: string,
+    hooks?: string
   ): Promise<Agent> {
     try {
       return await invoke<Agent>('create_agent', { 
@@ -726,10 +686,7 @@ export const api = {
         systemPrompt: system_prompt,
         defaultTask: default_task,
         model,
-        sandboxEnabled: sandbox_enabled,
-        enableFileRead: enable_file_read,
-        enableFileWrite: enable_file_write,
-        enableNetwork: enable_network
+        hooks
       });
     } catch (error) {
       console.error("Failed to create agent:", error);
@@ -745,10 +702,7 @@ export const api = {
    * @param system_prompt - The updated system prompt
    * @param default_task - Optional default task
    * @param model - Optional model
-   * @param sandbox_enabled - Optional sandbox enable flag
-   * @param enable_file_read - Optional file read permission
-   * @param enable_file_write - Optional file write permission
-   * @param enable_network - Optional network permission
+   * @param hooks - Optional hooks configuration as JSON string
    * @returns Promise resolving to the updated agent
    */
   async updateAgent(
@@ -757,11 +711,8 @@ export const api = {
     icon: string, 
     system_prompt: string, 
     default_task?: string, 
-    model?: string, 
-    sandbox_enabled?: boolean,
-    enable_file_read?: boolean,
-    enable_file_write?: boolean,
-    enable_network?: boolean
+    model?: string,
+    hooks?: string
   ): Promise<Agent> {
     try {
       return await invoke<Agent>('update_agent', { 
@@ -771,10 +722,7 @@ export const api = {
         systemPrompt: system_prompt,
         defaultTask: default_task,
         model,
-        sandboxEnabled: sandbox_enabled,
-        enableFileRead: enable_file_read,
-        enableFileWrite: enable_file_write,
-        enableNetwork: enable_network
+        hooks
       });
     } catch (error) {
       console.error("Failed to update agent:", error);
@@ -1017,6 +965,21 @@ export const api = {
   },
 
   /**
+   * Loads the JSONL history for a specific agent session
+   * Similar to loadSessionHistory but searches across all project directories
+   * @param sessionId - The session ID (UUID)
+   * @returns Promise resolving to array of session messages
+   */
+  async loadAgentSessionHistory(sessionId: string): Promise<any[]> {
+    try {
+      return await invoke<any[]>('load_agent_session_history', { sessionId });
+    } catch (error) {
+      console.error("Failed to load agent session history:", error);
+      throw error;
+    }
+  },
+
+  /**
    * Executes a new interactive Claude Code session with streaming output
    */
   async executeClaudeCode(projectPath: string, prompt: string, model: string): Promise<void> {
@@ -1046,6 +1009,23 @@ export const api = {
   },
 
   /**
+   * Lists all currently running Claude sessions
+   * @returns Promise resolving to list of running Claude sessions
+   */
+  async listRunningClaudeSessions(): Promise<any[]> {
+    return invoke("list_running_claude_sessions");
+  },
+
+  /**
+   * Gets live output from a Claude session
+   * @param sessionId - The session ID to get output for
+   * @returns Promise resolving to the current live output
+   */
+  async getClaudeSessionOutput(sessionId: string): Promise<string> {
+    return invoke("get_claude_session_output", { sessionId });
+  },
+
+  /**
    * Lists files and directories in a given path
    */
   async listDirectoryContents(directoryPath: string): Promise<FileEntry[]> {
@@ -1057,337 +1037,6 @@ export const api = {
    */
   async searchFiles(basePath: string, query: string): Promise<FileEntry[]> {
     return invoke("search_files", { basePath, query });
-  },
-
-  // Sandbox API methods
-
-  /**
-   * Lists all sandbox profiles
-   * @returns Promise resolving to an array of sandbox profiles
-   */
-  async listSandboxProfiles(): Promise<SandboxProfile[]> {
-    try {
-      return await invoke<SandboxProfile[]>('list_sandbox_profiles');
-    } catch (error) {
-      console.error("Failed to list sandbox profiles:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Creates a new sandbox profile
-   * @param name - The profile name
-   * @param description - Optional description
-   * @returns Promise resolving to the created profile
-   */
-  async createSandboxProfile(name: string, description?: string): Promise<SandboxProfile> {
-    try {
-      return await invoke<SandboxProfile>('create_sandbox_profile', { name, description });
-    } catch (error) {
-      console.error("Failed to create sandbox profile:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Updates a sandbox profile
-   * @param id - The profile ID
-   * @param name - The updated name
-   * @param description - Optional description
-   * @param is_active - Whether the profile is active
-   * @param is_default - Whether the profile is the default
-   * @returns Promise resolving to the updated profile
-   */
-  async updateSandboxProfile(
-    id: number, 
-    name: string, 
-    description: string | undefined, 
-    is_active: boolean, 
-    is_default: boolean
-  ): Promise<SandboxProfile> {
-    try {
-      return await invoke<SandboxProfile>('update_sandbox_profile', { 
-        id, 
-        name, 
-        description, 
-        is_active, 
-        is_default 
-      });
-    } catch (error) {
-      console.error("Failed to update sandbox profile:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Deletes a sandbox profile
-   * @param id - The profile ID to delete
-   * @returns Promise resolving when the profile is deleted
-   */
-  async deleteSandboxProfile(id: number): Promise<void> {
-    try {
-      return await invoke('delete_sandbox_profile', { id });
-    } catch (error) {
-      console.error("Failed to delete sandbox profile:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Gets a single sandbox profile by ID
-   * @param id - The profile ID
-   * @returns Promise resolving to the profile
-   */
-  async getSandboxProfile(id: number): Promise<SandboxProfile> {
-    try {
-      return await invoke<SandboxProfile>('get_sandbox_profile', { id });
-    } catch (error) {
-      console.error("Failed to get sandbox profile:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Lists rules for a sandbox profile
-   * @param profileId - The profile ID
-   * @returns Promise resolving to an array of rules
-   */
-  async listSandboxRules(profileId: number): Promise<SandboxRule[]> {
-    try {
-      return await invoke<SandboxRule[]>('list_sandbox_rules', { profile_id: profileId });
-    } catch (error) {
-      console.error("Failed to list sandbox rules:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Creates a new sandbox rule
-   * @param profileId - The profile ID
-   * @param operation_type - The operation type
-   * @param pattern_type - The pattern type
-   * @param pattern_value - The pattern value
-   * @param enabled - Whether the rule is enabled
-   * @param platform_support - Optional platform support JSON
-   * @returns Promise resolving to the created rule
-   */
-  async createSandboxRule(
-    profileId: number,
-    operation_type: string,
-    pattern_type: string,
-    pattern_value: string,
-    enabled: boolean,
-    platform_support?: string
-  ): Promise<SandboxRule> {
-    try {
-      return await invoke<SandboxRule>('create_sandbox_rule', { 
-        profile_id: profileId,
-        operation_type,
-        pattern_type,
-        pattern_value,
-        enabled,
-        platform_support
-      });
-    } catch (error) {
-      console.error("Failed to create sandbox rule:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Updates a sandbox rule
-   * @param id - The rule ID
-   * @param operation_type - The operation type
-   * @param pattern_type - The pattern type
-   * @param pattern_value - The pattern value
-   * @param enabled - Whether the rule is enabled
-   * @param platform_support - Optional platform support JSON
-   * @returns Promise resolving to the updated rule
-   */
-  async updateSandboxRule(
-    id: number,
-    operation_type: string,
-    pattern_type: string,
-    pattern_value: string,
-    enabled: boolean,
-    platform_support?: string
-  ): Promise<SandboxRule> {
-    try {
-      return await invoke<SandboxRule>('update_sandbox_rule', { 
-        id,
-        operation_type,
-        pattern_type,
-        pattern_value,
-        enabled,
-        platform_support
-      });
-    } catch (error) {
-      console.error("Failed to update sandbox rule:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Deletes a sandbox rule
-   * @param id - The rule ID to delete
-   * @returns Promise resolving when the rule is deleted
-   */
-  async deleteSandboxRule(id: number): Promise<void> {
-    try {
-      return await invoke('delete_sandbox_rule', { id });
-    } catch (error) {
-      console.error("Failed to delete sandbox rule:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Gets platform capabilities for sandbox configuration
-   * @returns Promise resolving to platform capabilities
-   */
-  async getPlatformCapabilities(): Promise<PlatformCapabilities> {
-    try {
-      return await invoke<PlatformCapabilities>('get_platform_capabilities');
-    } catch (error) {
-      console.error("Failed to get platform capabilities:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Tests a sandbox profile
-   * @param profileId - The profile ID to test
-   * @returns Promise resolving to test result message
-   */
-  async testSandboxProfile(profileId: number): Promise<string> {
-    try {
-      return await invoke<string>('test_sandbox_profile', { profile_id: profileId });
-    } catch (error) {
-      console.error("Failed to test sandbox profile:", error);
-      throw error;
-    }
-  },
-
-  // Sandbox violation methods
-
-  /**
-   * Lists sandbox violations with optional filtering
-   * @param profileId - Optional profile ID to filter by
-   * @param agentId - Optional agent ID to filter by
-   * @param limit - Optional limit on number of results
-   * @returns Promise resolving to array of violations
-   */
-  async listSandboxViolations(profileId?: number, agentId?: number, limit?: number): Promise<SandboxViolation[]> {
-    try {
-      return await invoke<SandboxViolation[]>('list_sandbox_violations', { 
-        profile_id: profileId, 
-        agent_id: agentId, 
-        limit 
-      });
-    } catch (error) {
-      console.error("Failed to list sandbox violations:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Logs a sandbox violation
-   * @param violation - The violation details
-   * @returns Promise resolving when logged
-   */
-  async logSandboxViolation(violation: {
-    profileId?: number;
-    agentId?: number;
-    agentRunId?: number;
-    operationType: string;
-    patternValue?: string;
-    processName?: string;
-    pid?: number;
-  }): Promise<void> {
-    try {
-      return await invoke('log_sandbox_violation', {
-        profile_id: violation.profileId,
-        agent_id: violation.agentId,
-        agent_run_id: violation.agentRunId,
-        operation_type: violation.operationType,
-        pattern_value: violation.patternValue,
-        process_name: violation.processName,
-        pid: violation.pid
-      });
-    } catch (error) {
-      console.error("Failed to log sandbox violation:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Clears old sandbox violations
-   * @param olderThanDays - Optional days to keep (clears all if not specified)
-   * @returns Promise resolving to number of deleted violations
-   */
-  async clearSandboxViolations(olderThanDays?: number): Promise<number> {
-    try {
-      return await invoke<number>('clear_sandbox_violations', { older_than_days: olderThanDays });
-    } catch (error) {
-      console.error("Failed to clear sandbox violations:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Gets sandbox violation statistics
-   * @returns Promise resolving to violation stats
-   */
-  async getSandboxViolationStats(): Promise<SandboxViolationStats> {
-    try {
-      return await invoke<SandboxViolationStats>('get_sandbox_violation_stats');
-    } catch (error) {
-      console.error("Failed to get sandbox violation stats:", error);
-      throw error;
-    }
-  },
-
-  // Import/Export methods
-
-  /**
-   * Exports a single sandbox profile with its rules
-   * @param profileId - The profile ID to export
-   * @returns Promise resolving to export data
-   */
-  async exportSandboxProfile(profileId: number): Promise<SandboxProfileExport> {
-    try {
-      return await invoke<SandboxProfileExport>('export_sandbox_profile', { profile_id: profileId });
-    } catch (error) {
-      console.error("Failed to export sandbox profile:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Exports all sandbox profiles
-   * @returns Promise resolving to export data
-   */
-  async exportAllSandboxProfiles(): Promise<SandboxProfileExport> {
-    try {
-      return await invoke<SandboxProfileExport>('export_all_sandbox_profiles');
-    } catch (error) {
-      console.error("Failed to export all sandbox profiles:", error);
-      throw error;
-    }
-  },
-
-  /**
-   * Imports sandbox profiles from export data
-   * @param exportData - The export data to import
-   * @returns Promise resolving to import results
-   */
-  async importSandboxProfiles(exportData: SandboxProfileExport): Promise<ImportResult[]> {
-    try {
-      return await invoke<ImportResult[]>('import_sandbox_profiles', { export_data: exportData });
-    } catch (error) {
-      console.error("Failed to import sandbox profiles:", error);
-      throw error;
-    }
   },
 
   /**
@@ -1889,39 +1538,6 @@ export const api = {
   },
 
   /**
-   * Captures a screenshot of a specific region in the window
-   * @param url - The URL to capture
-   * @param selector - Optional selector to capture
-   * @param fullPage - Whether to capture the full page
-   * @returns Promise resolving to the path of the saved screenshot
-   */
-  async captureUrlScreenshot(
-    url: string,
-    selector?: string | null,
-    fullPage: boolean = false
-  ): Promise<string> {
-    return await invoke<string>("capture_url_screenshot", {
-      url,
-      selector,
-      fullPage,
-    });
-  },
-
-  /**
-   * Cleans up old screenshot files from the temporary directory
-   * @param olderThanMinutes - Remove files older than this many minutes (default: 60)
-   * @returns Promise resolving to the number of files deleted
-   */
-  async cleanupScreenshotTempFiles(olderThanMinutes?: number): Promise<number> {
-    try {
-      return await invoke<number>("cleanup_screenshot_temp_files", { olderThanMinutes });
-    } catch (error) {
-      console.error("Failed to cleanup screenshot files:", error);
-      throw error;
-    }
-  },
-
-  /**
    * List all available Claude installations on the system
    * @returns Promise resolving to an array of Claude installations
    */
@@ -1933,4 +1549,291 @@ export const api = {
       throw error;
     }
   },
+
+  // Storage API methods
+
+  /**
+   * Lists all tables in the SQLite database
+   * @returns Promise resolving to an array of table information
+   */
+  async storageListTables(): Promise<any[]> {
+    try {
+      return await invoke<any[]>("storage_list_tables");
+    } catch (error) {
+      console.error("Failed to list tables:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Reads table data with pagination
+   * @param tableName - Name of the table to read
+   * @param page - Page number (1-indexed)
+   * @param pageSize - Number of rows per page
+   * @param searchQuery - Optional search query
+   * @returns Promise resolving to table data with pagination info
+   */
+  async storageReadTable(
+    tableName: string,
+    page: number,
+    pageSize: number,
+    searchQuery?: string
+  ): Promise<any> {
+    try {
+      return await invoke<any>("storage_read_table", {
+        tableName,
+        page,
+        pageSize,
+        searchQuery,
+      });
+    } catch (error) {
+      console.error("Failed to read table:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Updates a row in a table
+   * @param tableName - Name of the table
+   * @param primaryKeyValues - Map of primary key column names to values
+   * @param updates - Map of column names to new values
+   * @returns Promise resolving when the row is updated
+   */
+  async storageUpdateRow(
+    tableName: string,
+    primaryKeyValues: Record<string, any>,
+    updates: Record<string, any>
+  ): Promise<void> {
+    try {
+      return await invoke<void>("storage_update_row", {
+        tableName,
+        primaryKeyValues,
+        updates,
+      });
+    } catch (error) {
+      console.error("Failed to update row:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Deletes a row from a table
+   * @param tableName - Name of the table
+   * @param primaryKeyValues - Map of primary key column names to values
+   * @returns Promise resolving when the row is deleted
+   */
+  async storageDeleteRow(
+    tableName: string,
+    primaryKeyValues: Record<string, any>
+  ): Promise<void> {
+    try {
+      return await invoke<void>("storage_delete_row", {
+        tableName,
+        primaryKeyValues,
+      });
+    } catch (error) {
+      console.error("Failed to delete row:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Inserts a new row into a table
+   * @param tableName - Name of the table
+   * @param values - Map of column names to values
+   * @returns Promise resolving to the last insert row ID
+   */
+  async storageInsertRow(
+    tableName: string,
+    values: Record<string, any>
+  ): Promise<number> {
+    try {
+      return await invoke<number>("storage_insert_row", {
+        tableName,
+        values,
+      });
+    } catch (error) {
+      console.error("Failed to insert row:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Executes a raw SQL query
+   * @param query - SQL query string
+   * @returns Promise resolving to query result
+   */
+  async storageExecuteSql(query: string): Promise<any> {
+    try {
+      return await invoke<any>("storage_execute_sql", { query });
+    } catch (error) {
+      console.error("Failed to execute SQL:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Resets the entire database
+   * @returns Promise resolving when the database is reset
+   */
+  async storageResetDatabase(): Promise<void> {
+    try {
+      return await invoke<void>("storage_reset_database");
+    } catch (error) {
+      console.error("Failed to reset database:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Get hooks configuration for a specific scope
+   * @param scope - The configuration scope: 'user', 'project', or 'local'
+   * @param projectPath - Project path (required for project and local scopes)
+   * @returns Promise resolving to the hooks configuration
+   */
+  async getHooksConfig(scope: 'user' | 'project' | 'local', projectPath?: string): Promise<HooksConfiguration> {
+    try {
+      return await invoke<HooksConfiguration>("get_hooks_config", { scope, projectPath });
+    } catch (error) {
+      console.error("Failed to get hooks config:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Update hooks configuration for a specific scope
+   * @param scope - The configuration scope: 'user', 'project', or 'local'
+   * @param hooks - The hooks configuration to save
+   * @param projectPath - Project path (required for project and local scopes)
+   * @returns Promise resolving to success message
+   */
+  async updateHooksConfig(
+    scope: 'user' | 'project' | 'local',
+    hooks: HooksConfiguration,
+    projectPath?: string
+  ): Promise<string> {
+    try {
+      return await invoke<string>("update_hooks_config", { scope, projectPath, hooks });
+    } catch (error) {
+      console.error("Failed to update hooks config:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Validate a hook command syntax
+   * @param command - The shell command to validate
+   * @returns Promise resolving to validation result
+   */
+  async validateHookCommand(command: string): Promise<{ valid: boolean; message: string }> {
+    try {
+      return await invoke<{ valid: boolean; message: string }>("validate_hook_command", { command });
+    } catch (error) {
+      console.error("Failed to validate hook command:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Get merged hooks configuration (respecting priority)
+   * @param projectPath - The project path
+   * @returns Promise resolving to merged hooks configuration
+   */
+  async getMergedHooksConfig(projectPath: string): Promise<HooksConfiguration> {
+    try {
+      const [userHooks, projectHooks, localHooks] = await Promise.all([
+        this.getHooksConfig('user'),
+        this.getHooksConfig('project', projectPath),
+        this.getHooksConfig('local', projectPath)
+      ]);
+
+      // Import HooksManager for merging
+      const { HooksManager } = await import('@/lib/hooksManager');
+      return HooksManager.mergeConfigs(userHooks, projectHooks, localHooks);
+    } catch (error) {
+      console.error("Failed to get merged hooks config:", error);
+      throw error;
+    }
+  },
+
+  // Slash Commands API methods
+
+  /**
+   * Lists all available slash commands
+   * @param projectPath - Optional project path to include project-specific commands
+   * @returns Promise resolving to array of slash commands
+   */
+  async slashCommandsList(projectPath?: string): Promise<SlashCommand[]> {
+    try {
+      return await invoke<SlashCommand[]>("slash_commands_list", { projectPath });
+    } catch (error) {
+      console.error("Failed to list slash commands:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Gets a single slash command by ID
+   * @param commandId - Unique identifier of the command
+   * @returns Promise resolving to the slash command
+   */
+  async slashCommandGet(commandId: string): Promise<SlashCommand> {
+    try {
+      return await invoke<SlashCommand>("slash_command_get", { commandId });
+    } catch (error) {
+      console.error("Failed to get slash command:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Creates or updates a slash command
+   * @param scope - Command scope: "project" or "user"
+   * @param name - Command name (without prefix)
+   * @param namespace - Optional namespace for organization
+   * @param content - Markdown content of the command
+   * @param description - Optional description
+   * @param allowedTools - List of allowed tools for this command
+   * @param projectPath - Required for project scope commands
+   * @returns Promise resolving to the saved command
+   */
+  async slashCommandSave(
+    scope: string,
+    name: string,
+    namespace: string | undefined,
+    content: string,
+    description: string | undefined,
+    allowedTools: string[],
+    projectPath?: string
+  ): Promise<SlashCommand> {
+    try {
+      return await invoke<SlashCommand>("slash_command_save", {
+        scope,
+        name,
+        namespace,
+        content,
+        description,
+        allowedTools,
+        projectPath
+      });
+    } catch (error) {
+      console.error("Failed to save slash command:", error);
+      throw error;
+    }
+  },
+
+  /**
+   * Deletes a slash command
+   * @param commandId - Unique identifier of the command to delete
+   * @param projectPath - Optional project path for deleting project commands
+   * @returns Promise resolving to deletion message
+   */
+  async slashCommandDelete(commandId: string, projectPath?: string): Promise<string> {
+    try {
+      return await invoke<string>("slash_command_delete", { commandId, projectPath });
+    } catch (error) {
+      console.error("Failed to delete slash command:", error);
+      throw error;
+    }
+  }
 };

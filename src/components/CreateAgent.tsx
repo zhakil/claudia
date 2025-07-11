@@ -9,8 +9,8 @@ import { api, type Agent } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import MDEditor from "@uiw/react-md-editor";
 import { type AgentIconName } from "./CCAgents";
-import { AgentSandboxSettings } from "./AgentSandboxSettings";
 import { IconPicker, ICON_MAP } from "./IconPicker";
+
 
 interface CreateAgentProps {
   /**
@@ -48,10 +48,6 @@ export const CreateAgent: React.FC<CreateAgentProps> = ({
   const [systemPrompt, setSystemPrompt] = useState(agent?.system_prompt || "");
   const [defaultTask, setDefaultTask] = useState(agent?.default_task || "");
   const [model, setModel] = useState(agent?.model || "sonnet");
-  const [sandboxEnabled, setSandboxEnabled] = useState(agent?.sandbox_enabled ?? true);
-  const [enableFileRead, setEnableFileRead] = useState(agent?.enable_file_read ?? true);
-  const [enableFileWrite, setEnableFileWrite] = useState(agent?.enable_file_write ?? true);
-  const [enableNetwork, setEnableNetwork] = useState(agent?.enable_network ?? false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
@@ -81,11 +77,7 @@ export const CreateAgent: React.FC<CreateAgentProps> = ({
           selectedIcon, 
           systemPrompt, 
           defaultTask || undefined, 
-          model,
-          sandboxEnabled,
-          enableFileRead,
-          enableFileWrite,
-          enableNetwork
+          model
         );
       } else {
         await api.createAgent(
@@ -93,11 +85,7 @@ export const CreateAgent: React.FC<CreateAgentProps> = ({
           selectedIcon, 
           systemPrompt, 
           defaultTask || undefined, 
-          model,
-          sandboxEnabled,
-          enableFileRead,
-          enableFileWrite,
-          enableNetwork
+          model
         );
       }
       
@@ -119,11 +107,7 @@ export const CreateAgent: React.FC<CreateAgentProps> = ({
          selectedIcon !== (agent?.icon || "bot") || 
          systemPrompt !== (agent?.system_prompt || "") ||
          defaultTask !== (agent?.default_task || "") ||
-         model !== (agent?.model || "sonnet") ||
-         sandboxEnabled !== (agent?.sandbox_enabled ?? true) ||
-         enableFileRead !== (agent?.enable_file_read ?? true) ||
-         enableFileWrite !== (agent?.enable_file_write ?? true) ||
-         enableNetwork !== (agent?.enable_network ?? false)) && 
+         model !== (agent?.model || "sonnet")) && 
         !confirm("You have unsaved changes. Are you sure you want to leave?")) {
       return;
     }
@@ -192,11 +176,11 @@ export const CreateAgent: React.FC<CreateAgentProps> = ({
             transition={{ duration: 0.3, delay: 0.1 }}
             className="space-y-6"
           >
-            {/* Basic Information */}
-            <div className="space-y-4">
-              <div>
-                <h3 className="text-sm font-medium mb-4">Basic Information</h3>
-              </div>
+                {/* Basic Information */}
+                <div className="space-y-4">
+                  <div>
+                    <h3 className="text-sm font-medium mb-4">Basic Information</h3>
+                  </div>
               
               {/* Name and Icon */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -309,30 +293,6 @@ export const CreateAgent: React.FC<CreateAgentProps> = ({
                 </p>
               </div>
 
-              {/* Sandbox Settings */}
-              <AgentSandboxSettings
-                agent={{
-                  id: agent?.id,
-                  name,
-                  icon: selectedIcon,
-                  system_prompt: systemPrompt,
-                  default_task: defaultTask || undefined,
-                  model,
-                  sandbox_enabled: sandboxEnabled,
-                  enable_file_read: enableFileRead,
-                  enable_file_write: enableFileWrite,
-                  enable_network: enableNetwork,
-                  created_at: agent?.created_at || "",
-                  updated_at: agent?.updated_at || ""
-                }}
-                onUpdate={(updates) => {
-                  if ('sandbox_enabled' in updates) setSandboxEnabled(updates.sandbox_enabled!);
-                  if ('enable_file_read' in updates) setEnableFileRead(updates.enable_file_read!);
-                  if ('enable_file_write' in updates) setEnableFileWrite(updates.enable_file_write!);
-                  if ('enable_network' in updates) setEnableNetwork(updates.enable_network!);
-                }}
-              />
-
               {/* System Prompt Editor */}
               <div className="space-y-2">
                 <Label>System Prompt</Label>
@@ -353,28 +313,28 @@ export const CreateAgent: React.FC<CreateAgentProps> = ({
           </motion.div>
         </div>
       </div>
-      
-      {/* Toast Notification */}
-      <ToastContainer>
-        {toast && (
-          <Toast
-            message={toast.message}
-            type={toast.type}
-            onDismiss={() => setToast(null)}
-          />
-        )}
-      </ToastContainer>
-
-      {/* Icon Picker Dialog */}
-      <IconPicker
-        value={selectedIcon}
-        onSelect={(iconName) => {
-          setSelectedIcon(iconName as AgentIconName);
-          setShowIconPicker(false);
-        }}
-        isOpen={showIconPicker}
-        onClose={() => setShowIconPicker(false)}
+  
+  {/* Toast Notification */}
+  <ToastContainer>
+    {toast && (
+      <Toast
+        message={toast.message}
+        type={toast.type}
+        onDismiss={() => setToast(null)}
       />
-    </div>
+    )}
+  </ToastContainer>
+
+  {/* Icon Picker Dialog */}
+  <IconPicker
+    value={selectedIcon}
+    onSelect={(iconName) => {
+      setSelectedIcon(iconName as AgentIconName);
+      setShowIconPicker(false);
+    }}
+    isOpen={showIconPicker}
+    onClose={() => setShowIconPicker(false)}
+  />
+</div>
   );
 }; 

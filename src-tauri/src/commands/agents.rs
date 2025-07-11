@@ -1,16 +1,18 @@
-use crate::sandbox::profile::ProfileBuilder;
 use anyhow::Result;
 use chrono;
+use dirs;
 use log::{debug, error, info, warn};
+use regex;
 use reqwest;
 use rusqlite::{params, Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tauri_plugin_shell::ShellExt;
+use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 use tokio::process::Command;
 
 /// Finds the full path to the claude binary
@@ -28,10 +30,10 @@ pub struct Agent {
     pub system_prompt: String,
     pub default_task: Option<String>,
     pub model: String,
-    pub sandbox_enabled: bool,
     pub enable_file_read: bool,
     pub enable_file_write: bool,
     pub enable_network: bool,
+    pub hooks: Option<String>, // JSON string of hooks configuration
     pub created_at: String,
     pub updated_at: String,
 }
@@ -88,10 +90,7 @@ pub struct AgentData {
     pub system_prompt: String,
     pub default_task: Option<String>,
     pub model: String,
-    pub sandbox_enabled: bool,
-    pub enable_file_read: bool,
-    pub enable_file_write: bool,
-    pub enable_network: bool,
+    pub hooks: Option<String>,
 }
 
 /// Database connection state
@@ -235,10 +234,10 @@ pub fn init_database(app: &AppHandle) -> SqliteResult<Connection> {
             system_prompt TEXT NOT NULL,
             default_task TEXT,
             model TEXT NOT NULL DEFAULT 'sonnet',
-            sandbox_enabled BOOLEAN NOT NULL DEFAULT 1,
             enable_file_read BOOLEAN NOT NULL DEFAULT 1,
             enable_file_write BOOLEAN NOT NULL DEFAULT 1,
             enable_network BOOLEAN NOT NULL DEFAULT 0,
+            hooks TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
@@ -251,14 +250,7 @@ pub fn init_database(app: &AppHandle) -> SqliteResult<Connection> {
         "ALTER TABLE agents ADD COLUMN model TEXT DEFAULT 'sonnet'",
         [],
     );
-    let _ = conn.execute(
-        "ALTER TABLE agents ADD COLUMN sandbox_profile_id INTEGER REFERENCES sandbox_profiles(id)",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE agents ADD COLUMN sandbox_enabled BOOLEAN DEFAULT 1",
-        [],
-    );
+    let _ = conn.execute("ALTER TABLE agents ADD COLUMN hooks TEXT", []);
     let _ = conn.execute(
         "ALTER TABLE agents ADD COLUMN enable_file_read BOOLEAN DEFAULT 1",
         [],
@@ -329,75 +321,6 @@ pub fn init_database(app: &AppHandle) -> SqliteResult<Connection> {
         [],
     )?;
 
-    // Create sandbox profiles table
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS sandbox_profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            description TEXT,
-            is_active BOOLEAN NOT NULL DEFAULT 0,
-            is_default BOOLEAN NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )",
-        [],
-    )?;
-
-    // Create sandbox rules table
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS sandbox_rules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            profile_id INTEGER NOT NULL,
-            operation_type TEXT NOT NULL,
-            pattern_type TEXT NOT NULL,
-            pattern_value TEXT NOT NULL,
-            enabled BOOLEAN NOT NULL DEFAULT 1,
-            platform_support TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (profile_id) REFERENCES sandbox_profiles(id) ON DELETE CASCADE
-        )",
-        [],
-    )?;
-
-    // Create trigger to update sandbox profile timestamp
-    conn.execute(
-        "CREATE TRIGGER IF NOT EXISTS update_sandbox_profile_timestamp 
-         AFTER UPDATE ON sandbox_profiles 
-         FOR EACH ROW
-         BEGIN
-             UPDATE sandbox_profiles SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-         END",
-        [],
-    )?;
-
-    // Create sandbox violations table
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS sandbox_violations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            profile_id INTEGER,
-            agent_id INTEGER,
-            agent_run_id INTEGER,
-            operation_type TEXT NOT NULL,
-            pattern_value TEXT,
-            process_name TEXT,
-            pid INTEGER,
-            denied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (profile_id) REFERENCES sandbox_profiles(id) ON DELETE CASCADE,
-            FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
-            FOREIGN KEY (agent_run_id) REFERENCES agent_runs(id) ON DELETE CASCADE
-        )",
-        [],
-    )?;
-
-    // Create index for efficient querying
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_sandbox_violations_denied_at 
-         ON sandbox_violations(denied_at DESC)",
-        [],
-    )?;
-
-    // Create default sandbox profiles if they don't exist
-    crate::sandbox::defaults::create_default_profiles(&conn)?;
 
     // Create settings table for app-wide settings
     conn.execute(
@@ -430,7 +353,7 @@ pub async fn list_agents(db: State<'_, AgentDb>) -> Result<Vec<Agent>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
 
     let mut stmt = conn
-        .prepare("SELECT id, name, icon, system_prompt, default_task, model, sandbox_enabled, enable_file_read, enable_file_write, enable_network, created_at, updated_at FROM agents ORDER BY created_at DESC")
+        .prepare("SELECT id, name, icon, system_prompt, default_task, model, enable_file_read, enable_file_write, enable_network, hooks, created_at, updated_at FROM agents ORDER BY created_at DESC")
         .map_err(|e| e.to_string())?;
 
     let agents = stmt
@@ -444,10 +367,10 @@ pub async fn list_agents(db: State<'_, AgentDb>) -> Result<Vec<Agent>, String> {
                 model: row
                     .get::<_, String>(5)
                     .unwrap_or_else(|_| "sonnet".to_string()),
-                sandbox_enabled: row.get::<_, bool>(6).unwrap_or(true),
-                enable_file_read: row.get::<_, bool>(7).unwrap_or(true),
-                enable_file_write: row.get::<_, bool>(8).unwrap_or(true),
-                enable_network: row.get::<_, bool>(9).unwrap_or(false),
+                enable_file_read: row.get::<_, bool>(6).unwrap_or(true),
+                enable_file_write: row.get::<_, bool>(7).unwrap_or(true),
+                enable_network: row.get::<_, bool>(8).unwrap_or(false),
+                hooks: row.get(9)?,
                 created_at: row.get(10)?,
                 updated_at: row.get(11)?,
             })
@@ -468,21 +391,20 @@ pub async fn create_agent(
     system_prompt: String,
     default_task: Option<String>,
     model: Option<String>,
-    sandbox_enabled: Option<bool>,
     enable_file_read: Option<bool>,
     enable_file_write: Option<bool>,
     enable_network: Option<bool>,
+    hooks: Option<String>,
 ) -> Result<Agent, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let model = model.unwrap_or_else(|| "sonnet".to_string());
-    let sandbox_enabled = sandbox_enabled.unwrap_or(true);
     let enable_file_read = enable_file_read.unwrap_or(true);
     let enable_file_write = enable_file_write.unwrap_or(true);
     let enable_network = enable_network.unwrap_or(false);
 
     conn.execute(
-        "INSERT INTO agents (name, icon, system_prompt, default_task, model, sandbox_enabled, enable_file_read, enable_file_write, enable_network) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![name, icon, system_prompt, default_task, model, sandbox_enabled, enable_file_read, enable_file_write, enable_network],
+        "INSERT INTO agents (name, icon, system_prompt, default_task, model, enable_file_read, enable_file_write, enable_network, hooks) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![name, icon, system_prompt, default_task, model, enable_file_read, enable_file_write, enable_network, hooks],
     )
     .map_err(|e| e.to_string())?;
 
@@ -491,7 +413,7 @@ pub async fn create_agent(
     // Fetch the created agent
     let agent = conn
         .query_row(
-            "SELECT id, name, icon, system_prompt, default_task, model, sandbox_enabled, enable_file_read, enable_file_write, enable_network, created_at, updated_at FROM agents WHERE id = ?1",
+            "SELECT id, name, icon, system_prompt, default_task, model, enable_file_read, enable_file_write, enable_network, hooks, created_at, updated_at FROM agents WHERE id = ?1",
             params![id],
             |row| {
                 Ok(Agent {
@@ -501,10 +423,10 @@ pub async fn create_agent(
                     system_prompt: row.get(3)?,
                     default_task: row.get(4)?,
                     model: row.get(5)?,
-                    sandbox_enabled: row.get(6)?,
-                    enable_file_read: row.get(7)?,
-                    enable_file_write: row.get(8)?,
-                    enable_network: row.get(9)?,
+                    enable_file_read: row.get(6)?,
+                    enable_file_write: row.get(7)?,
+                    enable_network: row.get(8)?,
+                    hooks: row.get(9)?,
                     created_at: row.get(10)?,
                     updated_at: row.get(11)?,
                 })
@@ -525,17 +447,17 @@ pub async fn update_agent(
     system_prompt: String,
     default_task: Option<String>,
     model: Option<String>,
-    sandbox_enabled: Option<bool>,
     enable_file_read: Option<bool>,
     enable_file_write: Option<bool>,
     enable_network: Option<bool>,
+    hooks: Option<String>,
 ) -> Result<Agent, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     let model = model.unwrap_or_else(|| "sonnet".to_string());
 
     // Build dynamic query based on provided parameters
     let mut query =
-        "UPDATE agents SET name = ?1, icon = ?2, system_prompt = ?3, default_task = ?4, model = ?5"
+        "UPDATE agents SET name = ?1, icon = ?2, system_prompt = ?3, default_task = ?4, model = ?5, hooks = ?6"
             .to_string();
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
         Box::new(name),
@@ -543,14 +465,10 @@ pub async fn update_agent(
         Box::new(system_prompt),
         Box::new(default_task),
         Box::new(model),
+        Box::new(hooks),
     ];
-    let mut param_count = 5;
+    let mut param_count = 6;
 
-    if let Some(se) = sandbox_enabled {
-        param_count += 1;
-        query.push_str(&format!(", sandbox_enabled = ?{}", param_count));
-        params_vec.push(Box::new(se));
-    }
     if let Some(efr) = enable_file_read {
         param_count += 1;
         query.push_str(&format!(", enable_file_read = ?{}", param_count));
@@ -580,7 +498,7 @@ pub async fn update_agent(
     // Fetch the updated agent
     let agent = conn
         .query_row(
-            "SELECT id, name, icon, system_prompt, default_task, model, sandbox_enabled, enable_file_read, enable_file_write, enable_network, created_at, updated_at FROM agents WHERE id = ?1",
+            "SELECT id, name, icon, system_prompt, default_task, model, enable_file_read, enable_file_write, enable_network, hooks, created_at, updated_at FROM agents WHERE id = ?1",
             params![id],
             |row| {
                 Ok(Agent {
@@ -590,10 +508,10 @@ pub async fn update_agent(
                     system_prompt: row.get(3)?,
                     default_task: row.get(4)?,
                     model: row.get(5)?,
-                    sandbox_enabled: row.get(6)?,
-                    enable_file_read: row.get(7)?,
-                    enable_file_write: row.get(8)?,
-                    enable_network: row.get(9)?,
+                    enable_file_read: row.get(6)?,
+                    enable_file_write: row.get(7)?,
+                    enable_network: row.get(8)?,
+                    hooks: row.get(9)?,
                     created_at: row.get(10)?,
                     updated_at: row.get(11)?,
                 })
@@ -622,7 +540,7 @@ pub async fn get_agent(db: State<'_, AgentDb>, id: i64) -> Result<Agent, String>
 
     let agent = conn
         .query_row(
-            "SELECT id, name, icon, system_prompt, default_task, model, sandbox_enabled, enable_file_read, enable_file_write, enable_network, created_at, updated_at FROM agents WHERE id = ?1",
+            "SELECT id, name, icon, system_prompt, default_task, model, enable_file_read, enable_file_write, enable_network, hooks, created_at, updated_at FROM agents WHERE id = ?1",
             params![id],
             |row| {
                 Ok(Agent {
@@ -632,10 +550,10 @@ pub async fn get_agent(db: State<'_, AgentDb>, id: i64) -> Result<Agent, String>
                     system_prompt: row.get(3)?,
                     default_task: row.get(4)?,
                     model: row.get::<_, String>(5).unwrap_or_else(|_| "sonnet".to_string()),
-                    sandbox_enabled: row.get::<_, bool>(6).unwrap_or(true),
-                    enable_file_read: row.get::<_, bool>(7).unwrap_or(true),
-                    enable_file_write: row.get::<_, bool>(8).unwrap_or(true),
-                    enable_network: row.get::<_, bool>(9).unwrap_or(false),
+                    enable_file_read: row.get::<_, bool>(6).unwrap_or(true),
+                    enable_file_write: row.get::<_, bool>(7).unwrap_or(true),
+                    enable_network: row.get::<_, bool>(8).unwrap_or(false),
+                    hooks: row.get(9)?,
                     created_at: row.get(10)?,
                     updated_at: row.get(11)?,
                 })
@@ -776,6 +694,42 @@ pub async fn execute_agent(
     // Get the agent from database
     let agent = get_agent(db.clone(), agent_id).await?;
     let execution_model = model.unwrap_or(agent.model.clone());
+    
+    // Create .claude/settings.json with agent hooks if it doesn't exist
+    if let Some(hooks_json) = &agent.hooks {
+        let claude_dir = std::path::Path::new(&project_path).join(".claude");
+        let settings_path = claude_dir.join("settings.json");
+        
+        // Create .claude directory if it doesn't exist
+        if !claude_dir.exists() {
+            std::fs::create_dir_all(&claude_dir)
+                .map_err(|e| format!("Failed to create .claude directory: {}", e))?;
+            info!("Created .claude directory at: {:?}", claude_dir);
+        }
+        
+        // Check if settings.json already exists
+        if !settings_path.exists() {
+            // Parse the hooks JSON
+            let hooks: serde_json::Value = serde_json::from_str(hooks_json)
+                .map_err(|e| format!("Failed to parse agent hooks: {}", e))?;
+            
+            // Create a settings object with just the hooks
+            let settings = serde_json::json!({
+                "hooks": hooks
+            });
+            
+            // Write the settings file
+            let settings_content = serde_json::to_string_pretty(&settings)
+                .map_err(|e| format!("Failed to serialize settings: {}", e))?;
+            
+            std::fs::write(&settings_path, settings_content)
+                .map_err(|e| format!("Failed to write settings.json: {}", e))?;
+            
+            info!("Created settings.json with agent hooks at: {:?}", settings_path);
+        } else {
+            info!("settings.json already exists at: {:?}", settings_path);
+        }
+    }
 
     // Create a new run record
     let run_id = {
@@ -788,414 +742,338 @@ pub async fn execute_agent(
         conn.last_insert_rowid()
     };
 
-    // Create sandbox rules based on agent-specific permissions (no database dependency)
-    let sandbox_profile = if !agent.sandbox_enabled {
-        info!("🔓 Agent '{}': Sandbox DISABLED", agent.name);
-        None
-    } else {
-        info!(
-            "🔒 Agent '{}': Sandbox enabled | File Read: {} | File Write: {} | Network: {}",
-            agent.name, agent.enable_file_read, agent.enable_file_write, agent.enable_network
-        );
-
-        // Create rules dynamically based on agent permissions
-        let mut rules = Vec::new();
-
-        // Add file read rules if enabled
-        if agent.enable_file_read {
-            // Project directory access
-            rules.push(crate::sandbox::profile::SandboxRule {
-                id: Some(1),
-                profile_id: 0,
-                operation_type: "file_read_all".to_string(),
-                pattern_type: "subpath".to_string(),
-                pattern_value: "{{PROJECT_PATH}}".to_string(),
-                enabled: true,
-                platform_support: Some(r#"["linux", "macos", "windows"]"#.to_string()),
-                created_at: String::new(),
-            });
-
-            // System libraries (for language runtimes, etc.)
-            rules.push(crate::sandbox::profile::SandboxRule {
-                id: Some(2),
-                profile_id: 0,
-                operation_type: "file_read_all".to_string(),
-                pattern_type: "subpath".to_string(),
-                pattern_value: "/usr/lib".to_string(),
-                enabled: true,
-                platform_support: Some(r#"["linux", "macos"]"#.to_string()),
-                created_at: String::new(),
-            });
-
-            rules.push(crate::sandbox::profile::SandboxRule {
-                id: Some(3),
-                profile_id: 0,
-                operation_type: "file_read_all".to_string(),
-                pattern_type: "subpath".to_string(),
-                pattern_value: "/usr/local/lib".to_string(),
-                enabled: true,
-                platform_support: Some(r#"["linux", "macos"]"#.to_string()),
-                created_at: String::new(),
-            });
-
-            rules.push(crate::sandbox::profile::SandboxRule {
-                id: Some(4),
-                profile_id: 0,
-                operation_type: "file_read_all".to_string(),
-                pattern_type: "subpath".to_string(),
-                pattern_value: "/System/Library".to_string(),
-                enabled: true,
-                platform_support: Some(r#"["macos"]"#.to_string()),
-                created_at: String::new(),
-            });
-
-            rules.push(crate::sandbox::profile::SandboxRule {
-                id: Some(5),
-                profile_id: 0,
-                operation_type: "file_read_metadata".to_string(),
-                pattern_type: "subpath".to_string(),
-                pattern_value: "/".to_string(),
-                enabled: true,
-                platform_support: Some(r#"["macos"]"#.to_string()),
-                created_at: String::new(),
-            });
+    // Find Claude binary
+    info!("Running agent '{}'", agent.name);
+    let claude_path = match find_claude_binary(&app) {
+        Ok(path) => path,
+        Err(e) => {
+            error!("Failed to find claude binary: {}", e);
+            return Err(e);
         }
-
-        // Add network rules if enabled
-        if agent.enable_network {
-            rules.push(crate::sandbox::profile::SandboxRule {
-                id: Some(6),
-                profile_id: 0,
-                operation_type: "network_outbound".to_string(),
-                pattern_type: "all".to_string(),
-                pattern_value: "".to_string(),
-                enabled: true,
-                platform_support: Some(r#"["linux", "macos"]"#.to_string()),
-                created_at: String::new(),
-            });
-        }
-
-        // Always add essential system paths (needed for executables to run)
-        rules.push(crate::sandbox::profile::SandboxRule {
-            id: Some(7),
-            profile_id: 0,
-            operation_type: "file_read_all".to_string(),
-            pattern_type: "subpath".to_string(),
-            pattern_value: "/usr/bin".to_string(),
-            enabled: true,
-            platform_support: Some(r#"["linux", "macos"]"#.to_string()),
-            created_at: String::new(),
-        });
-
-        rules.push(crate::sandbox::profile::SandboxRule {
-            id: Some(8),
-            profile_id: 0,
-            operation_type: "file_read_all".to_string(),
-            pattern_type: "subpath".to_string(),
-            pattern_value: "/opt/homebrew/bin".to_string(),
-            enabled: true,
-            platform_support: Some(r#"["macos"]"#.to_string()),
-            created_at: String::new(),
-        });
-
-        rules.push(crate::sandbox::profile::SandboxRule {
-            id: Some(9),
-            profile_id: 0,
-            operation_type: "file_read_all".to_string(),
-            pattern_type: "subpath".to_string(),
-            pattern_value: "/usr/local/bin".to_string(),
-            enabled: true,
-            platform_support: Some(r#"["linux", "macos"]"#.to_string()),
-            created_at: String::new(),
-        });
-
-        rules.push(crate::sandbox::profile::SandboxRule {
-            id: Some(10),
-            profile_id: 0,
-            operation_type: "file_read_all".to_string(),
-            pattern_type: "subpath".to_string(),
-            pattern_value: "/bin".to_string(),
-            enabled: true,
-            platform_support: Some(r#"["linux", "macos"]"#.to_string()),
-            created_at: String::new(),
-        });
-
-        // System libraries (needed for executables to link)
-        rules.push(crate::sandbox::profile::SandboxRule {
-            id: Some(11),
-            profile_id: 0,
-            operation_type: "file_read_all".to_string(),
-            pattern_type: "subpath".to_string(),
-            pattern_value: "/usr/lib".to_string(),
-            enabled: true,
-            platform_support: Some(r#"["linux", "macos"]"#.to_string()),
-            created_at: String::new(),
-        });
-
-        rules.push(crate::sandbox::profile::SandboxRule {
-            id: Some(12),
-            profile_id: 0,
-            operation_type: "file_read_all".to_string(),
-            pattern_type: "subpath".to_string(),
-            pattern_value: "/System/Library".to_string(),
-            enabled: true,
-            platform_support: Some(r#"["macos"]"#.to_string()),
-            created_at: String::new(),
-        });
-
-        // Always add system info reading (minimal requirement)
-        rules.push(crate::sandbox::profile::SandboxRule {
-            id: Some(13),
-            profile_id: 0,
-            operation_type: "system_info_read".to_string(),
-            pattern_type: "all".to_string(),
-            pattern_value: "".to_string(),
-            enabled: true,
-            platform_support: Some(r#"["linux", "macos"]"#.to_string()),
-            created_at: String::new(),
-        });
-
-        Some(("Agent-specific".to_string(), rules))
     };
 
-    // Build the command
-    let mut cmd = if let Some((_profile_name, rules)) = sandbox_profile {
-        info!("🧪 DEBUG: Testing Claude command first without sandbox...");
-        // Quick test to see if Claude is accessible at all
-        let claude_path = match find_claude_binary(&app) {
-            Ok(path) => path,
-            Err(e) => {
-                error!("❌ Claude binary not found: {}", e);
-                return Err(e);
+    // Build arguments
+    let args = vec![
+        "-p".to_string(),
+        task.clone(),
+        "--system-prompt".to_string(),
+        agent.system_prompt.clone(),
+        "--model".to_string(),
+        execution_model.clone(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+    ];
+
+    // Execute based on whether we should use sidecar or system binary
+    if should_use_sidecar(&claude_path) {
+        spawn_agent_sidecar(app, run_id, agent_id, agent.name.clone(), args, project_path, task, execution_model, db, registry).await
+    } else {
+        spawn_agent_system(app, run_id, agent_id, agent.name.clone(), claude_path, args, project_path, task, execution_model, db, registry).await
+    }
+}
+
+/// Determines whether to use sidecar or system binary execution for agents
+fn should_use_sidecar(claude_path: &str) -> bool {
+    claude_path == "claude-code"
+}
+
+/// Creates a sidecar command for agent execution
+fn create_agent_sidecar_command(
+    app: &AppHandle,
+    args: Vec<String>,
+    project_path: &str,
+) -> Result<tauri_plugin_shell::process::Command, String> {
+    let mut sidecar_cmd = app
+        .shell()
+        .sidecar("claude-code")
+        .map_err(|e| format!("Failed to create sidecar command: {}", e))?;
+    
+    // Add all arguments
+    sidecar_cmd = sidecar_cmd.args(args);
+    
+    // Set working directory
+    sidecar_cmd = sidecar_cmd.current_dir(project_path);
+    
+    Ok(sidecar_cmd)
+}
+
+/// Creates a system binary command for agent execution
+fn create_agent_system_command(
+    claude_path: &str,
+    args: Vec<String>,
+    project_path: &str,
+) -> Command {
+    let mut cmd = create_command_with_env(claude_path);
+    
+    // Add all arguments
+    for arg in args {
+        cmd.arg(arg);
+    }
+    
+    cmd.current_dir(project_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    
+    cmd
+}
+
+/// Spawn agent using sidecar command
+async fn spawn_agent_sidecar(
+    app: AppHandle,
+    run_id: i64,
+    _agent_id: i64,
+    _agent_name: String,
+    args: Vec<String>,
+    project_path: String,
+    _task: String,
+    _execution_model: String,
+    db: State<'_, AgentDb>,
+    registry: State<'_, crate::process::ProcessRegistryState>,
+) -> Result<i64, String> {
+    use std::sync::Mutex;
+
+    // Create the sidecar command
+    let sidecar_cmd = create_agent_sidecar_command(&app, args, &project_path)?;
+    
+    // Spawn the sidecar process
+    let (mut rx, child) = sidecar_cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn Claude sidecar: {}", e))?;
+
+    // Get the child PID for logging
+    let pid = child.pid();
+    info!("✅ Spawned Claude sidecar process with PID: {:?}", pid);
+
+    // Update the database with PID and status
+    let now = chrono::Utc::now().to_rfc3339();
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE agent_runs SET status = 'running', pid = ?1, process_started_at = ?2 WHERE id = ?3",
+            params![pid as i64, now, run_id],
+        ).map_err(|e| e.to_string())?;
+        info!("📝 Updated database with running status and PID");
+    }
+
+    // We'll extract the session ID from Claude's init message
+    let session_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    // Create variables we need for the spawned task
+    let app_dir = app
+        .path()
+        .app_data_dir()
+        .expect("Failed to get app data dir");
+    let db_path = app_dir.join("agents.db");
+    let db_path_for_stream = db_path.clone(); // Clone for the streaming task
+
+    // Spawn task to read events from sidecar
+    let app_handle = app.clone();
+    let session_id_holder_clone = session_id_holder.clone();
+    let live_output = std::sync::Arc::new(Mutex::new(String::new()));
+    let live_output_clone = live_output.clone();
+    let registry_clone = registry.0.clone();
+    let first_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let first_output_clone = first_output.clone();
+
+    let sidecar_task = tokio::spawn(async move {
+        info!("📖 Starting to read Claude sidecar events...");
+        let mut line_count = 0;
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                tauri_plugin_shell::process::CommandEvent::Stdout(data) => {
+                    let line = String::from_utf8_lossy(&data).trim().to_string();
+                    if !line.is_empty() {
+                        line_count += 1;
+
+                        // Log first output
+                        if !first_output_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                            info!("🎉 First output received from Claude sidecar! Line: {}", line);
+                            first_output_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+
+                        if line_count <= 5 {
+                            info!("sidecar stdout[{}]: {}", line_count, line);
+                        } else {
+                            debug!("sidecar stdout[{}]: {}", line_count, line);
+                        }
+
+                        // Store live output
+                        if let Ok(mut output) = live_output_clone.lock() {
+                            output.push_str(&line);
+                            output.push('\n');
+                        }
+
+                        // Also store in process registry for cross-session access
+                        let _ = registry_clone.append_live_output(run_id, &line);
+
+                        // Extract session ID from JSONL output
+                        if let Ok(json) = serde_json::from_str::<JsonValue>(&line) {
+                            // Claude Code uses "session_id" (underscore), not "sessionId"
+                            if json.get("type").and_then(|t| t.as_str()) == Some("system") &&
+                               json.get("subtype").and_then(|s| s.as_str()) == Some("init") {
+                                if let Some(sid) = json.get("session_id").and_then(|s| s.as_str()) {
+                                    if let Ok(mut current_session_id) = session_id_holder_clone.lock() {
+                                        if current_session_id.is_none() {
+                                            *current_session_id = Some(sid.to_string());
+                                            info!("🔑 Extracted session ID: {}", sid);
+                                            
+                                            // Update database immediately with session ID
+                                            if let Ok(conn) = Connection::open(&db_path_for_stream) {
+                                                match conn.execute(
+                                                    "UPDATE agent_runs SET session_id = ?1 WHERE id = ?2",
+                                                    params![sid, run_id],
+                                                ) {
+                                                    Ok(rows) => {
+                                                        if rows > 0 {
+                                                            info!("✅ Updated agent run {} with session ID immediately", run_id);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        error!("❌ Failed to update session ID immediately: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Emit the line to the frontend with run_id for isolation
+                        let _ = app_handle.emit(&format!("agent-output:{}", run_id), &line);
+                        // Also emit to the generic event for backward compatibility
+                        let _ = app_handle.emit("agent-output", &line);
+                    }
+                }
+                tauri_plugin_shell::process::CommandEvent::Stderr(data) => {
+                    let line = String::from_utf8_lossy(&data).trim().to_string();
+                    if !line.is_empty() {
+                        error!("sidecar stderr: {}", line);
+                        // Emit error lines to the frontend with run_id for isolation
+                        let _ = app_handle.emit(&format!("agent-error:{}", run_id), &line);
+                        // Also emit to the generic event for backward compatibility
+                        let _ = app_handle.emit("agent-error", &line);
+                    }
+                }
+                tauri_plugin_shell::process::CommandEvent::Terminated { .. } => {
+                    info!("📖 Claude sidecar process terminated");
+                    break;
+                }
+                tauri_plugin_shell::process::CommandEvent::Error(e) => {
+                    error!("🔥 Claude sidecar error: {}", e);
+                    break;
+                }
+                _ => {
+                    // Handle any other event types we might not know about
+                    debug!("Received unknown sidecar event type");
+                }
             }
-        };
-        match std::process::Command::new(&claude_path)
-            .arg("--version")
-            .output()
-        {
-            Ok(output) => {
-                if output.status.success() {
-                    info!(
-                        "✅ Claude command works: {}",
-                        String::from_utf8_lossy(&output.stdout).trim()
+        }
+
+        info!("📖 Finished reading Claude sidecar events. Total lines: {}", line_count);
+    });
+
+    // Monitor process status and wait for completion
+    tokio::spawn(async move {
+        info!("🕐 Starting sidecar process monitoring...");
+
+        // Wait for first output with timeout
+        for i in 0..300 {
+            // 30 seconds (300 * 100ms)
+            if first_output.load(std::sync::atomic::Ordering::Relaxed) {
+                info!("✅ Output detected after {}ms, continuing normal execution", i * 100);
+                break;
+            }
+
+            if i == 299 {
+                warn!("⏰ TIMEOUT: No output from Claude sidecar after 30 seconds");
+                warn!("💡 This usually means:");
+                warn!("   1. Claude sidecar is waiting for user input");
+                warn!("   2. Authentication issues (API key not found/invalid)");
+                warn!("   3. Network connectivity issues");
+                warn!("   4. Claude failed to initialize but didn't report an error");
+
+                // Update database with failed status
+                if let Ok(conn) = Connection::open(&db_path) {
+                    let _ = conn.execute(
+                        "UPDATE agent_runs SET status = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                        params![run_id],
                     );
-                } else {
-                    warn!("⚠️ Claude command failed with status: {}", output.status);
-                    warn!("   stdout: {}", String::from_utf8_lossy(&output.stdout));
-                    warn!("   stderr: {}", String::from_utf8_lossy(&output.stderr));
                 }
+
+                let _ = app.emit("agent-complete", false);
+                let _ = app.emit(&format!("agent-complete:{}", run_id), false);
+                return;
             }
-            Err(e) => {
-                error!("❌ Claude command not found or not executable: {}", e);
-                error!("   This could be why the agent is failing to start");
-            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
 
-        // Test if Claude can actually start a session (this might reveal auth issues)
-        info!("🧪 Testing Claude with exact same arguments as agent (without sandbox env vars)...");
-        let mut test_cmd = std::process::Command::new(&claude_path);
-        test_cmd
-            .arg("-p")
-            .arg(&task)
-            .arg("--system-prompt")
-            .arg(&agent.system_prompt)
-            .arg("--model")
-            .arg(&execution_model)
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose")
-            .arg("--dangerously-skip-permissions")
-            .current_dir(&project_path);
+        // Wait for sidecar task to complete
+        info!("⏳ Waiting for sidecar reading to complete...");
+        let _ = sidecar_task.await;
 
-        info!("🧪 Testing command: claude -p \"{}\" --system-prompt \"{}\" --model {} --output-format stream-json --verbose --dangerously-skip-permissions", 
-              task, agent.system_prompt, execution_model);
-
-        // Start the test process and give it 5 seconds to produce output
-        match test_cmd.spawn() {
-            Ok(mut child) => {
-                // Wait for 5 seconds to see if it produces output
-                let start = std::time::Instant::now();
-                let mut output_received = false;
-
-                while start.elapsed() < std::time::Duration::from_secs(5) {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            info!("🧪 Test process exited with status: {}", status);
-                            output_received = true;
-                            break;
-                        }
-                        Ok(None) => {
-                            // Still running
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                        Err(e) => {
-                            warn!("🧪 Error checking test process: {}", e);
-                            break;
-                        }
-                    }
-                }
-
-                if !output_received {
-                    warn!("🧪 Test process is still running after 5 seconds - this suggests Claude might be waiting for input");
-                    // Kill the test process
-                    let _ = child.kill();
-                    let _ = child.wait();
-                } else {
-                    info!("🧪 Test process completed quickly - command seems to work");
-                }
-            }
-            Err(e) => {
-                error!("❌ Failed to spawn test Claude process: {}", e);
-            }
-        }
-
-        info!("🧪 End of Claude test, proceeding with sandbox...");
-
-        // Build the gaol profile using agent-specific permissions
-        let project_path_buf = PathBuf::from(&project_path);
-
-        match ProfileBuilder::new(project_path_buf.clone()) {
-            Ok(builder) => {
-                // Build agent-specific profile with permission filtering
-                match builder.build_agent_profile(
-                    rules,
-                    agent.sandbox_enabled,
-                    agent.enable_file_read,
-                    agent.enable_file_write,
-                    agent.enable_network,
-                ) {
-                    Ok(build_result) => {
-                        // Create the enhanced sandbox executor
-                        #[cfg(unix)]
-                        let executor =
-                            crate::sandbox::executor::SandboxExecutor::new_with_serialization(
-                                build_result.profile,
-                                project_path_buf.clone(),
-                                build_result.serialized,
-                            );
-
-                        #[cfg(not(unix))]
-                        let executor =
-                            crate::sandbox::executor::SandboxExecutor::new_with_serialization(
-                                (),
-                                project_path_buf.clone(),
-                                build_result.serialized,
-                            );
-
-                        // Prepare the sandboxed command
-                        let args = vec![
-                            "-p",
-                            &task,
-                            "--system-prompt",
-                            &agent.system_prompt,
-                            "--model",
-                            &execution_model,
-                            "--output-format",
-                            "stream-json",
-                            "--verbose",
-                            "--dangerously-skip-permissions",
-                        ];
-
-                        let claude_path = match find_claude_binary(&app) {
-                            Ok(path) => path,
-                            Err(e) => {
-                                error!("Failed to find claude binary: {}", e);
-                                return Err(e);
-                            }
-                        };
-                        executor.prepare_sandboxed_command(&claude_path, &args, &project_path_buf)
-                    }
-                    Err(e) => {
-                        error!("Failed to build agent-specific sandbox profile: {}, falling back to non-sandboxed", e);
-                        let claude_path = match find_claude_binary(&app) {
-                            Ok(path) => path,
-                            Err(e) => {
-                                error!("Failed to find claude binary: {}", e);
-                                return Err(e);
-                            }
-                        };
-                        let mut cmd = create_command_with_env(&claude_path);
-                        cmd.arg("-p")
-                            .arg(&task)
-                            .arg("--system-prompt")
-                            .arg(&agent.system_prompt)
-                            .arg("--model")
-                            .arg(&execution_model)
-                            .arg("--output-format")
-                            .arg("stream-json")
-                            .arg("--verbose")
-                            .arg("--dangerously-skip-permissions")
-                            .current_dir(&project_path)
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped());
-                        cmd
-                    }
-                }
-            }
-            Err(e) => {
-                error!(
-                    "Failed to create ProfileBuilder: {}, falling back to non-sandboxed",
-                    e
-                );
-
-                // Fall back to non-sandboxed command
-                let claude_path = match find_claude_binary(&app) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        error!("Failed to find claude binary: {}", e);
-                        return Err(e);
-                    }
-                };
-                let mut cmd = create_command_with_env(&claude_path);
-                cmd.arg("-p")
-                    .arg(&task)
-                    .arg("--system-prompt")
-                    .arg(&agent.system_prompt)
-                    .arg("--model")
-                    .arg(&execution_model)
-                    .arg("--output-format")
-                    .arg("stream-json")
-                    .arg("--verbose")
-                    .arg("--dangerously-skip-permissions")
-                    .current_dir(&project_path)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                cmd
-            }
-        }
-    } else {
-        // No sandbox or sandbox disabled, use regular command
-        warn!(
-            "🚨 Running agent '{}' WITHOUT SANDBOX - full system access!",
-            agent.name
-        );
-        let claude_path = match find_claude_binary(&app) {
-            Ok(path) => path,
-            Err(e) => {
-                error!("Failed to find claude binary: {}", e);
-                return Err(e);
-            }
+        // Get the session ID that was extracted
+        let extracted_session_id = if let Ok(Some(sid)) = session_id_holder.lock().map(|s| s.clone()) {
+            sid
+        } else {
+            String::new()
         };
-        let mut cmd = create_command_with_env(&claude_path);
-        cmd.arg("-p")
-            .arg(&task)
-            .arg("--system-prompt")
-            .arg(&agent.system_prompt)
-            .arg("--model")
-            .arg(&execution_model)
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose")
-            .arg("--dangerously-skip-permissions")
-            .current_dir(&project_path)
-            .stdin(Stdio::null()) // Don't pipe stdin - we have no input to send
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        cmd
-    };
+
+        // Update the run record with session ID and mark as completed
+        if let Ok(conn) = Connection::open(&db_path) {
+            info!("🔄 Updating database with extracted session ID: {}", extracted_session_id);
+            match conn.execute(
+                "UPDATE agent_runs SET session_id = ?1, status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                params![extracted_session_id, run_id],
+            ) {
+                Ok(rows_affected) => {
+                    if rows_affected > 0 {
+                        info!("✅ Successfully updated agent run {} with session ID: {}", run_id, extracted_session_id);
+                    } else {
+                        warn!("⚠️ No rows affected when updating agent run {} with session ID", run_id);
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Failed to update agent run {} with session ID: {}", run_id, e);
+                }
+            }
+        } else {
+            error!("❌ Failed to open database to update session ID for run {}", run_id);
+        }
+
+        info!("✅ Claude sidecar execution monitoring complete");
+
+        let _ = app.emit("agent-complete", true);
+        let _ = app.emit(&format!("agent-complete:{}", run_id), true);
+    });
+
+    Ok(run_id)
+}
+
+/// Spawn agent using system binary command
+async fn spawn_agent_system(
+    app: AppHandle,
+    run_id: i64,
+    agent_id: i64,
+    agent_name: String,
+    claude_path: String,
+    args: Vec<String>,
+    project_path: String,
+    task: String,
+    execution_model: String,
+    db: State<'_, AgentDb>,
+    registry: State<'_, crate::process::ProcessRegistryState>,
+) -> Result<i64, String> {
+    // Build the command
+    let mut cmd = create_agent_system_command(&claude_path, args, &project_path);
 
     // Spawn the process
-    info!("🚀 Spawning Claude process...");
+    info!("🚀 Spawning Claude system process...");
     let mut child = cmd.spawn().map_err(|e| {
         error!("❌ Failed to spawn Claude process: {}", e);
         format!("Failed to spawn Claude: {}", e)
@@ -1224,8 +1102,15 @@ pub async fn execute_agent(
     info!("📡 Set up stdout/stderr readers");
 
     // Create readers
-    let stdout_reader = BufReader::new(stdout);
-    let stderr_reader = BufReader::new(stderr);
+    let stdout_reader = TokioBufReader::new(stdout);
+    let stderr_reader = TokioBufReader::new(stderr);
+
+    // Create variables we need for the spawned tasks
+    let app_dir = app
+        .path()
+        .app_data_dir()
+        .expect("Failed to get app data dir");
+    let db_path = app_dir.join("agents.db");
 
     // Shared state for collecting session ID and live output
     let session_id = std::sync::Arc::new(Mutex::new(String::new()));
@@ -1239,6 +1124,7 @@ pub async fn execute_agent(
     let registry_clone = registry.0.clone();
     let first_output = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let first_output_clone = first_output.clone();
+    let db_path_for_stdout = db_path.clone(); // Clone the db_path for the stdout task
 
     let stdout_task = tokio::spawn(async move {
         info!("📖 Starting to read Claude stdout...");
@@ -1274,11 +1160,32 @@ pub async fn execute_agent(
 
             // Extract session ID from JSONL output
             if let Ok(json) = serde_json::from_str::<JsonValue>(&line) {
-                if let Some(sid) = json.get("sessionId").and_then(|s| s.as_str()) {
-                    if let Ok(mut current_session_id) = session_id_clone.lock() {
-                        if current_session_id.is_empty() {
-                            *current_session_id = sid.to_string();
-                            info!("🔑 Extracted session ID: {}", sid);
+                // Claude Code uses "session_id" (underscore), not "sessionId"
+                if json.get("type").and_then(|t| t.as_str()) == Some("system") &&
+                   json.get("subtype").and_then(|s| s.as_str()) == Some("init") {
+                    if let Some(sid) = json.get("session_id").and_then(|s| s.as_str()) {
+                        if let Ok(mut current_session_id) = session_id_clone.lock() {
+                            if current_session_id.is_empty() {
+                                *current_session_id = sid.to_string();
+                                info!("🔑 Extracted session ID: {}", sid);
+                                
+                                // Update database immediately with session ID
+                                if let Ok(conn) = Connection::open(&db_path_for_stdout) {
+                                    match conn.execute(
+                                        "UPDATE agent_runs SET session_id = ?1 WHERE id = ?2",
+                                        params![sid, run_id],
+                                    ) {
+                                        Ok(rows) => {
+                                            if rows > 0 {
+                                                info!("✅ Updated agent run {} with session ID immediately", run_id);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("❌ Failed to update session ID immediately: {}", e);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1337,7 +1244,7 @@ pub async fn execute_agent(
         .register_process(
             run_id,
             agent_id,
-            agent.name.clone(),
+            agent_name,
             pid,
             project_path.clone(),
             task.clone(),
@@ -1347,12 +1254,7 @@ pub async fn execute_agent(
         .map_err(|e| format!("Failed to register process: {}", e))?;
     info!("📋 Registered process in registry");
 
-    // Create variables we need for the spawned task
-    let app_dir = app
-        .path()
-        .app_data_dir()
-        .expect("Failed to get app data dir");
-    let db_path = app_dir.join("agents.db");
+    let db_path_for_monitor = db_path.clone(); // Clone for the monitor task
 
     // Monitor process status and wait for completion
     tokio::spawn(async move {
@@ -1369,64 +1271,54 @@ pub async fn execute_agent(
                 break;
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if i == 299 {
+                warn!("⏰ TIMEOUT: No output from Claude process after 30 seconds");
+                warn!("💡 This usually means:");
+                warn!("   1. Claude process is waiting for user input");
+                warn!("   3. Claude failed to initialize but didn't report an error");
+                warn!("   4. Network connectivity issues");
+                warn!("   5. Authentication issues (API key not found/invalid)");
 
-            // Log progress every 5 seconds
-            if i > 0 && i % 50 == 0 {
-                info!(
-                    "⏳ Still waiting for Claude output... ({}s elapsed)",
-                    i / 10
+                // Process timed out - kill it via PID
+                warn!(
+                    "🔍 Process likely stuck waiting for input, attempting to kill PID: {}",
+                    pid
                 );
-            }
-        }
+                let kill_result = std::process::Command::new("kill")
+                    .arg("-TERM")
+                    .arg(pid.to_string())
+                    .output();
 
-        // Check if we timed out
-        if !first_output.load(std::sync::atomic::Ordering::Relaxed) {
-            warn!("⏰ TIMEOUT: No output from Claude process after 30 seconds");
-            warn!("💡 This usually means:");
-            warn!("   1. Claude process is waiting for user input");
-            warn!("   2. Sandbox permissions are too restrictive");
-            warn!("   3. Claude failed to initialize but didn't report an error");
-            warn!("   4. Network connectivity issues");
-            warn!("   5. Authentication issues (API key not found/invalid)");
+                match kill_result {
+                    Ok(output) if output.status.success() => {
+                        warn!("🔍 Successfully sent TERM signal to process");
+                    }
+                    Ok(_) => {
+                        warn!("🔍 Failed to kill process with TERM, trying KILL");
+                        let _ = std::process::Command::new("kill")
+                            .arg("-KILL")
+                            .arg(pid.to_string())
+                            .output();
+                    }
+                    Err(e) => {
+                        warn!("🔍 Error killing process: {}", e);
+                    }
+                }
 
-            // Process timed out - kill it via PID
-            warn!(
-                "🔍 Process likely stuck waiting for input, attempting to kill PID: {}",
-                pid
-            );
-            let kill_result = std::process::Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .output();
+                // Update database
+                if let Ok(conn) = Connection::open(&db_path_for_monitor) {
+                    let _ = conn.execute(
+                        "UPDATE agent_runs SET status = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                        params![run_id],
+                    );
+                }
 
-            match kill_result {
-                Ok(output) if output.status.success() => {
-                    warn!("🔍 Successfully sent TERM signal to process");
-                }
-                Ok(_) => {
-                    warn!("🔍 Failed to kill process with TERM, trying KILL");
-                    let _ = std::process::Command::new("kill")
-                        .arg("-KILL")
-                        .arg(pid.to_string())
-                        .output();
-                }
-                Err(e) => {
-                    warn!("🔍 Error killing process: {}", e);
-                }
+                let _ = app.emit("agent-complete", false);
+                let _ = app.emit(&format!("agent-complete:{}", run_id), false);
+                return;
             }
 
-            // Update database
-            if let Ok(conn) = Connection::open(&db_path) {
-                let _ = conn.execute(
-                    "UPDATE agent_runs SET status = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                    params![run_id],
-                );
-            }
-
-            let _ = app.emit("agent-complete", false);
-            let _ = app.emit(&format!("agent-complete:{}", run_id), false);
-            return;
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
 
         // Wait for reading tasks to complete
@@ -1448,11 +1340,25 @@ pub async fn execute_agent(
         info!("✅ Claude process execution monitoring complete");
 
         // Update the run record with session ID and mark as completed - open a new connection
-        if let Ok(conn) = Connection::open(&db_path) {
-            let _ = conn.execute(
+        if let Ok(conn) = Connection::open(&db_path_for_monitor) {
+            info!("🔄 Updating database with extracted session ID: {}", extracted_session_id);
+            match conn.execute(
                 "UPDATE agent_runs SET session_id = ?1, status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?2",
                 params![extracted_session_id, run_id],
-            );
+            ) {
+                Ok(rows_affected) => {
+                    if rows_affected > 0 {
+                        info!("✅ Successfully updated agent run {} with session ID: {}", run_id, extracted_session_id);
+                    } else {
+                        warn!("⚠️ No rows affected when updating agent run {} with session ID", run_id);
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Failed to update agent run {} with session ID: {}", run_id, e);
+                }
+            }
+        } else {
+            error!("❌ Failed to open database to update session ID for run {}", run_id);
         }
 
         // Cleanup will be handled by the cleanup_finished_processes function
@@ -1466,15 +1372,19 @@ pub async fn execute_agent(
 
 /// List all currently running agent sessions
 #[tauri::command]
-pub async fn list_running_sessions(db: State<'_, AgentDb>) -> Result<Vec<AgentRun>, String> {
+pub async fn list_running_sessions(
+    db: State<'_, AgentDb>,
+    registry: State<'_, crate::process::ProcessRegistryState>,
+) -> Result<Vec<AgentRun>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
 
+    // First get all running sessions from the database
     let mut stmt = conn.prepare(
         "SELECT id, agent_id, agent_name, agent_icon, task, model, project_path, session_id, status, pid, process_started_at, created_at, completed_at 
          FROM agent_runs WHERE status = 'running' ORDER BY process_started_at DESC"
     ).map_err(|e| e.to_string())?;
 
-    let runs = stmt
+    let mut runs = stmt
         .query_map([], |row| {
             Ok(AgentRun {
                 id: Some(row.get(0)?),
@@ -1501,6 +1411,27 @@ pub async fn list_running_sessions(db: State<'_, AgentDb>) -> Result<Vec<AgentRu
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
+
+    drop(stmt);
+    drop(conn);
+
+    // Cross-check with the process registry to ensure accuracy
+    // Get actually running processes from the registry
+    let registry_processes = registry.0.get_running_agent_processes()?;
+    let registry_run_ids: std::collections::HashSet<i64> = registry_processes
+        .iter()
+        .map(|p| p.run_id)
+        .collect();
+
+    // Filter out any database entries that aren't actually running in the registry
+    // This handles cases where processes crashed without updating the database
+    runs.retain(|run| {
+        if let Some(run_id) = run.id {
+            registry_run_ids.contains(&run_id)
+        } else {
+            false
+        }
+    });
 
     Ok(runs)
 }
@@ -1676,13 +1607,66 @@ pub async fn get_session_output(
         return Ok(String::new());
     }
 
-    // Read the JSONL content
-    match read_session_jsonl(&run.session_id, &run.project_path).await {
-        Ok(content) => Ok(content),
-        Err(_) => {
-            // Fallback to live output if JSONL file doesn't exist yet
-            let live_output = registry.0.get_live_output(run_id)?;
-            Ok(live_output)
+    // Get the Claude directory
+    let claude_dir = dirs::home_dir()
+        .ok_or("Failed to get home directory")?
+        .join(".claude");
+
+    // Find the correct project directory by searching for the session file
+    let projects_dir = claude_dir.join("projects");
+    
+    // Check if projects directory exists
+    if !projects_dir.exists() {
+        log::error!("Projects directory not found at: {:?}", projects_dir);
+        return Err("Projects directory not found".to_string());
+    }
+
+    // Search for the session file in all project directories
+    let mut session_file_path = None;
+    log::info!("Searching for session file {} in all project directories", run.session_id);
+    
+    if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
+                log::debug!("Checking project directory: {}", dir_name);
+                
+                let potential_session_file = path.join(format!("{}.jsonl", run.session_id));
+                if potential_session_file.exists() {
+                    log::info!("Found session file at: {:?}", potential_session_file);
+                    session_file_path = Some(potential_session_file);
+                    break;
+                } else {
+                    log::debug!("Session file not found in: {}", dir_name);
+                }
+            }
+        }
+    } else {
+        log::error!("Failed to read projects directory");
+    }
+
+    // If we found the session file, read it
+    if let Some(session_path) = session_file_path {
+        match tokio::fs::read_to_string(&session_path).await {
+            Ok(content) => Ok(content),
+            Err(e) => {
+                log::error!("Failed to read session file {}: {}", session_path.display(), e);
+                // Fallback to live output if file read fails
+                let live_output = registry.0.get_live_output(run_id)?;
+                Ok(live_output)
+            }
+        }
+    } else {
+        // If session file not found, try the old method as fallback
+        log::warn!("Session file not found for {}, trying legacy method", run.session_id);
+        match read_session_jsonl(&run.session_id, &run.project_path).await {
+            Ok(content) => Ok(content),
+            Err(_) => {
+                // Final fallback to live output
+                let live_output = registry.0.get_live_output(run_id)?;
+                Ok(live_output)
+            }
         }
     }
 }
@@ -1782,7 +1766,7 @@ pub async fn export_agent(db: State<'_, AgentDb>, id: i64) -> Result<String, Str
     // Fetch the agent
     let agent = conn
         .query_row(
-            "SELECT name, icon, system_prompt, default_task, model, sandbox_enabled, enable_file_read, enable_file_write, enable_network FROM agents WHERE id = ?1",
+            "SELECT name, icon, system_prompt, default_task, model, hooks FROM agents WHERE id = ?1",
             params![id],
             |row| {
                 Ok(serde_json::json!({
@@ -1791,10 +1775,7 @@ pub async fn export_agent(db: State<'_, AgentDb>, id: i64) -> Result<String, Str
                     "system_prompt": row.get::<_, String>(2)?,
                     "default_task": row.get::<_, Option<String>>(3)?,
                     "model": row.get::<_, String>(4)?,
-                    "sandbox_enabled": row.get::<_, bool>(5)?,
-                    "enable_file_read": row.get::<_, bool>(6)?,
-                    "enable_file_write": row.get::<_, bool>(7)?,
-                    "enable_network": row.get::<_, bool>(8)?
+                    "hooks": row.get::<_, Option<String>>(5)?
                 }))
             },
         )
@@ -1849,7 +1830,20 @@ pub async fn get_claude_binary_path(db: State<'_, AgentDb>) -> Result<Option<Str
 pub async fn set_claude_binary_path(db: State<'_, AgentDb>, path: String) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
 
-    // Validate that the path exists and is executable
+    // Special handling for bundled sidecar reference
+    if path == "claude-code" {
+        // For bundled sidecar, we don't need to validate file existence
+        // as it's handled by Tauri's sidecar system
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('claude_binary_path', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            params![path],
+        )
+        .map_err(|e| format!("Failed to save Claude binary path: {}", e))?;
+        return Ok(());
+    }
+
+    // Validate that the path exists and is executable for system installations
     let path_buf = std::path::PathBuf::from(&path);
     if !path_buf.exists() {
         return Err(format!("File does not exist: {}", path));
@@ -1881,11 +1875,83 @@ pub async fn set_claude_binary_path(db: State<'_, AgentDb>, path: String) -> Res
 /// List all available Claude installations on the system
 #[tauri::command]
 pub async fn list_claude_installations(
+    app: AppHandle,
 ) -> Result<Vec<crate::claude_binary::ClaudeInstallation>, String> {
-    let installations = crate::claude_binary::discover_claude_installations();
+    let mut installations = crate::claude_binary::discover_claude_installations();
 
     if installations.is_empty() {
         return Err("No Claude Code installations found on the system".to_string());
+    }
+
+    // For bundled installations, execute the sidecar to get the actual version
+    for installation in &mut installations {
+        if installation.installation_type == crate::claude_binary::InstallationType::Bundled {
+            // Try to get the version by executing the sidecar
+            use tauri_plugin_shell::process::CommandEvent;
+            
+            // Create a temporary directory for the sidecar to run in
+            let temp_dir = std::env::temp_dir();
+            
+            // Create sidecar command with --version flag
+            let sidecar_cmd = match app
+                .shell()
+                .sidecar("claude-code") {
+                Ok(cmd) => cmd.args(["--version"]).current_dir(&temp_dir),
+                Err(e) => {
+                    log::warn!("Failed to create sidecar command for version check: {}", e);
+                    continue;
+                }
+            };
+            
+            // Spawn the sidecar and collect output
+            match sidecar_cmd.spawn() {
+                Ok((mut rx, _child)) => {
+                    let mut stdout_output = String::new();
+                    let mut stderr_output = String::new();
+                    
+                    // Set a timeout for version check
+                    let timeout = tokio::time::Duration::from_secs(5);
+                    let start_time = tokio::time::Instant::now();
+                    
+                    while let Ok(Some(event)) = tokio::time::timeout_at(
+                        start_time + timeout,
+                        rx.recv()
+                    ).await {
+                        match event {
+                            CommandEvent::Stdout(data) => {
+                                stdout_output.push_str(&String::from_utf8_lossy(&data));
+                            }
+                            CommandEvent::Stderr(data) => {
+                                stderr_output.push_str(&String::from_utf8_lossy(&data));
+                            }
+                            CommandEvent::Terminated { .. } => {
+                                break;
+                            }
+                            CommandEvent::Error(e) => {
+                                log::warn!("Error during sidecar version check: {}", e);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    
+                    // Use regex to directly extract version pattern
+                    let version_regex = regex::Regex::new(r"(\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?(?:\+[a-zA-Z0-9.-]+)?)").ok();
+                    
+                    if let Some(regex) = version_regex {
+                        if let Some(captures) = regex.captures(&stdout_output) {
+                            if let Some(version_match) = captures.get(1) {
+                                installation.version = Some(version_match.as_str().to_string());
+                                log::info!("Bundled sidecar version: {}", version_match.as_str());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to spawn sidecar for version check: {}", e);
+                }
+            }
+        }
     }
 
     Ok(installations)
@@ -1946,6 +2012,26 @@ fn create_command_with_env(program: &str) -> Command {
         tokio_cmd.env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
     }
 
+    // BEGIN PATCH: Ensure bundled sidecar directory is in PATH when using the "claude-code" placeholder
+    if program == "claude-code" {
+        // Attempt to locate the sidecar binaries directory that Tauri uses during development
+        // At compile-time, CARGO_MANIFEST_DIR resolves to the absolute path of the src-tauri crate.
+        // The sidecar binaries live in <src-tauri>/binaries.
+        #[allow(clippy::redundant_clone)]
+        let sidecar_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries");
+        if sidecar_dir.exists() {
+            if let Some(sidecar_dir_str) = sidecar_dir.to_str() {
+                let current_path = std::env::var("PATH").unwrap_or_default();
+                let separator = if cfg!(target_os = "windows") { ";" } else { ":" };
+                if !current_path.split(separator).any(|p| p == sidecar_dir_str) {
+                    let new_path = format!("{}{}{}", sidecar_dir_str, separator, current_path);
+                    tokio_cmd.env("PATH", new_path);
+                }
+            }
+        }
+    }
+    // END PATCH
+
     tokio_cmd
 }
 
@@ -1985,17 +2071,14 @@ pub async fn import_agent(db: State<'_, AgentDb>, json_data: String) -> Result<A
 
     // Create the agent
     conn.execute(
-        "INSERT INTO agents (name, icon, system_prompt, default_task, model, sandbox_enabled, enable_file_read, enable_file_write, enable_network) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO agents (name, icon, system_prompt, default_task, model, enable_file_read, enable_file_write, enable_network, hooks) VALUES (?1, ?2, ?3, ?4, ?5, 1, 1, 0, ?6)",
         params![
             final_name,
             agent_data.icon,
             agent_data.system_prompt,
             agent_data.default_task,
             agent_data.model,
-            agent_data.sandbox_enabled,
-            agent_data.enable_file_read,
-            agent_data.enable_file_write,
-            agent_data.enable_network
+            agent_data.hooks
         ],
     )
     .map_err(|e| format!("Failed to create agent: {}", e))?;
@@ -2005,7 +2088,7 @@ pub async fn import_agent(db: State<'_, AgentDb>, json_data: String) -> Result<A
     // Fetch the created agent
     let agent = conn
         .query_row(
-            "SELECT id, name, icon, system_prompt, default_task, model, sandbox_enabled, enable_file_read, enable_file_write, enable_network, created_at, updated_at FROM agents WHERE id = ?1",
+            "SELECT id, name, icon, system_prompt, default_task, model, enable_file_read, enable_file_write, enable_network, hooks, created_at, updated_at FROM agents WHERE id = ?1",
             params![id],
             |row| {
                 Ok(Agent {
@@ -2015,10 +2098,10 @@ pub async fn import_agent(db: State<'_, AgentDb>, json_data: String) -> Result<A
                     system_prompt: row.get(3)?,
                     default_task: row.get(4)?,
                     model: row.get(5)?,
-                    sandbox_enabled: row.get(6)?,
-                    enable_file_read: row.get(7)?,
-                    enable_file_write: row.get(8)?,
-                    enable_network: row.get(9)?,
+                    enable_file_read: row.get(6)?,
+                    enable_file_write: row.get(7)?,
+                    enable_network: row.get(8)?,
+                    hooks: row.get(9)?,
                     created_at: row.get(10)?,
                     updated_at: row.get(11)?,
                 })
@@ -2171,4 +2254,69 @@ pub async fn import_agent_from_github(
 
     // Import using existing function
     import_agent(db, json_data).await
+}
+
+/// Load agent session history from JSONL file
+/// Similar to Claude Code's load_session_history, but searches across all project directories
+#[tauri::command]
+pub async fn load_agent_session_history(
+    session_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    log::info!("Loading agent session history for session: {}", session_id);
+
+    let claude_dir = dirs::home_dir()
+        .ok_or("Failed to get home directory")?
+        .join(".claude");
+
+    let projects_dir = claude_dir.join("projects");
+    
+    if !projects_dir.exists() {
+        log::error!("Projects directory not found at: {:?}", projects_dir);
+        return Err("Projects directory not found".to_string());
+    }
+
+    // Search for the session file in all project directories
+    let mut session_file_path = None;
+    log::info!("Searching for session file {} in all project directories", session_id);
+    
+    if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                let dir_name = path.file_name().unwrap_or_default().to_string_lossy();
+                log::debug!("Checking project directory: {}", dir_name);
+                
+                let potential_session_file = path.join(format!("{}.jsonl", session_id));
+                if potential_session_file.exists() {
+                    log::info!("Found session file at: {:?}", potential_session_file);
+                    session_file_path = Some(potential_session_file);
+                    break;
+                } else {
+                    log::debug!("Session file not found in: {}", dir_name);
+                }
+            }
+        }
+    } else {
+        log::error!("Failed to read projects directory");
+    }
+
+    if let Some(session_path) = session_file_path {
+        let file = std::fs::File::open(&session_path)
+            .map_err(|e| format!("Failed to open session file: {}", e))?;
+
+        let reader = BufReader::new(file);
+        let mut messages = Vec::new();
+
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                    messages.push(json);
+                }
+            }
+        }
+
+        Ok(messages)
+    } else {
+        Err(format!("Session file not found: {}", session_id))
+    }
 }

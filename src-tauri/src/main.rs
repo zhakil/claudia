@@ -5,7 +5,6 @@ mod checkpoint;
 mod claude_binary;
 mod commands;
 mod process;
-mod sandbox;
 
 use checkpoint::state::CheckpointState;
 use commands::agents::{
@@ -15,34 +14,33 @@ use commands::agents::{
     get_live_session_output, get_session_output, get_session_status, import_agent,
     import_agent_from_file, import_agent_from_github, init_database, kill_agent_session,
     list_agent_runs, list_agent_runs_with_metrics, list_agents, list_claude_installations,
-    list_running_sessions, set_claude_binary_path, stream_session_output, update_agent, AgentDb,
+    list_running_sessions, load_agent_session_history, set_claude_binary_path, stream_session_output, update_agent, AgentDb,
 };
 use commands::claude::{
     cancel_claude_execution, check_auto_checkpoint, check_claude_version, cleanup_old_checkpoints,
     clear_checkpoint_manager, continue_claude_code, create_checkpoint, execute_claude_code,
     find_claude_md_files, fork_from_checkpoint, get_checkpoint_diff, get_checkpoint_settings,
-    get_checkpoint_state_stats, get_claude_settings, get_project_sessions,
+    get_checkpoint_state_stats, get_claude_session_output, get_claude_settings, get_project_sessions,
     get_recently_modified_files, get_session_timeline, get_system_prompt, list_checkpoints,
-    list_directory_contents, list_projects, load_session_history, open_new_session,
-    read_claude_md_file, restore_checkpoint, resume_claude_code, save_claude_md_file,
-    save_claude_settings, save_system_prompt, search_files, track_checkpoint_message,
-    track_session_messages, update_checkpoint_settings, ClaudeProcessState,
+    list_directory_contents, list_projects, list_running_claude_sessions, load_session_history,
+    open_new_session, read_claude_md_file, restore_checkpoint, resume_claude_code,
+    save_claude_md_file, save_claude_settings, save_system_prompt, search_files,
+    track_checkpoint_message, track_session_messages, update_checkpoint_settings,
+    get_hooks_config, update_hooks_config, validate_hook_command,
+    ClaudeProcessState,
 };
 use commands::mcp::{
     mcp_add, mcp_add_from_claude_desktop, mcp_add_json, mcp_get, mcp_get_server_status, mcp_list,
     mcp_read_project_config, mcp_remove, mcp_reset_project_choices, mcp_save_project_config,
     mcp_serve, mcp_test_connection,
 };
-use commands::sandbox::{
-    clear_sandbox_violations, create_sandbox_profile, create_sandbox_rule, delete_sandbox_profile,
-    delete_sandbox_rule, export_all_sandbox_profiles, export_sandbox_profile,
-    get_platform_capabilities, get_sandbox_profile, get_sandbox_violation_stats,
-    import_sandbox_profiles, list_sandbox_profiles, list_sandbox_rules, list_sandbox_violations,
-    log_sandbox_violation, test_sandbox_profile, update_sandbox_profile, update_sandbox_rule,
-};
-use commands::screenshot::{capture_url_screenshot, cleanup_screenshot_temp_files};
+
 use commands::usage::{
     get_session_stats, get_usage_by_date_range, get_usage_details, get_usage_stats,
+};
+use commands::storage::{
+    storage_list_tables, storage_read_table, storage_update_row, storage_delete_row,
+    storage_insert_row, storage_execute_sql, storage_reset_database,
 };
 use process::ProcessRegistryState;
 use std::sync::Mutex;
@@ -52,17 +50,10 @@ fn main() {
     // Initialize logger
     env_logger::init();
 
-    // Check if we need to activate sandbox in this process
-    if sandbox::executor::should_activate_sandbox() {
-        // This is a child process that needs sandbox activation
-        if let Err(e) = sandbox::executor::SandboxExecutor::activate_sandbox_in_child() {
-            log::error!("Failed to activate sandbox: {}", e);
-            // Continue without sandbox rather than crashing
-        }
-    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             // Initialize agents database
             let conn = init_database(&app.handle()).expect("Failed to initialize agents database");
@@ -98,6 +89,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // Claude & Project Management
             list_projects,
             get_project_sessions,
             get_claude_settings,
@@ -114,8 +106,16 @@ fn main() {
             continue_claude_code,
             resume_claude_code,
             cancel_claude_execution,
+            list_running_claude_sessions,
+            get_claude_session_output,
             list_directory_contents,
             search_files,
+            get_recently_modified_files,
+            get_hooks_config,
+            update_hooks_config,
+            validate_hook_command,
+            
+            // Checkpoint Management
             create_checkpoint,
             restore_checkpoint,
             list_checkpoints,
@@ -130,7 +130,8 @@ fn main() {
             get_checkpoint_settings,
             clear_checkpoint_manager,
             get_checkpoint_state_stats,
-            get_recently_modified_files,
+            
+            // Agent Management
             list_agents,
             create_agent,
             update_agent,
@@ -148,6 +149,7 @@ fn main() {
             get_session_output,
             get_live_session_output,
             stream_session_output,
+            load_agent_session_history,
             get_claude_binary_path,
             set_claude_binary_path,
             list_claude_installations,
@@ -158,28 +160,14 @@ fn main() {
             fetch_github_agents,
             fetch_github_agent_content,
             import_agent_from_github,
-            list_sandbox_profiles,
-            get_sandbox_profile,
-            create_sandbox_profile,
-            update_sandbox_profile,
-            delete_sandbox_profile,
-            list_sandbox_rules,
-            create_sandbox_rule,
-            update_sandbox_rule,
-            delete_sandbox_rule,
-            test_sandbox_profile,
-            get_platform_capabilities,
-            list_sandbox_violations,
-            log_sandbox_violation,
-            clear_sandbox_violations,
-            get_sandbox_violation_stats,
-            export_sandbox_profile,
-            export_all_sandbox_profiles,
-            import_sandbox_profiles,
+            
+            // Usage & Analytics
             get_usage_stats,
             get_usage_by_date_range,
             get_usage_details,
             get_session_stats,
+            
+            // MCP (Model Context Protocol)
             mcp_add,
             mcp_list,
             mcp_get,
@@ -192,8 +180,21 @@ fn main() {
             mcp_get_server_status,
             mcp_read_project_config,
             mcp_save_project_config,
-            capture_url_screenshot,
-            cleanup_screenshot_temp_files
+            
+            // Storage Management
+            storage_list_tables,
+            storage_read_table,
+            storage_update_row,
+            storage_delete_row,
+            storage_insert_row,
+            storage_execute_sql,
+            storage_reset_database,
+            
+            // Slash Commands
+            commands::slash_commands::slash_commands_list,
+            commands::slash_commands::slash_command_get,
+            commands::slash_commands::slash_command_save,
+            commands::slash_commands::slash_command_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

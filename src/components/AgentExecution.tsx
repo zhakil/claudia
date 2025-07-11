@@ -11,12 +11,21 @@ import {
   Copy,
   ChevronDown,
   Maximize2,
-  X
+  X,
+  Settings2
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover } from "@/components/ui/popover";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { api, type Agent } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -25,6 +34,8 @@ import { StreamMessage } from "./StreamMessage";
 import { ExecutionControlBar } from "./ExecutionControlBar";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { AGENT_ICONS } from "./CCAgents";
+import { HooksEditor } from "./HooksEditor";
 
 interface AgentExecutionProps {
   /**
@@ -78,6 +89,10 @@ export const AgentExecution: React.FC<AgentExecutionProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [copyPopoverOpen, setCopyPopoverOpen] = useState(false);
   
+  // Hooks configuration state
+  const [isHooksDialogOpen, setIsHooksDialogOpen] = useState(false);
+  const [activeHooksTab, setActiveHooksTab] = useState("project");
+
   // Execution stats
   const [executionStartTime, setExecutionStartTime] = useState<number | null>(null);
   const [totalTokens, setTotalTokens] = useState(0);
@@ -92,6 +107,7 @@ export const AgentExecution: React.FC<AgentExecutionProps> = ({
   const fullscreenMessagesEndRef = useRef<HTMLDivElement>(null);
   const unlistenRefs = useRef<UnlistenFn[]>([]);
   const elapsedTimeIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [runId, setRunId] = useState<number | null>(null);
 
   // Filter out messages that shouldn't be displayed
   const displayableMessages = React.useMemo(() => {
@@ -265,25 +281,29 @@ export const AgentExecution: React.FC<AgentExecutionProps> = ({
     }
   };
 
-  const handleExecute = async () => {
-    if (!projectPath || !task.trim()) return;
+  const handleOpenHooksDialog = async () => {
+    setIsHooksDialogOpen(true);
+  };
 
-    let runId: number | null = null;
-    
+  const handleExecute = async () => {
     try {
       setIsRunning(true);
-      setError(null);
+      setExecutionStartTime(Date.now());
       setMessages([]);
       setRawJsonlOutput([]);
-      setExecutionStartTime(Date.now());
-      setElapsedTime(0);
-      setTotalTokens(0);
-
-      // Execute the agent with model override and get run ID
-      runId = await api.executeAgent(agent.id!, projectPath, task, model);
+      setRunId(null);
+      
+      // Clear any existing listeners
+      unlistenRefs.current.forEach(unlisten => unlisten());
+      unlistenRefs.current = [];
+      
+      // Execute the agent and get the run ID
+      const executionRunId = await api.executeAgent(agent.id!, projectPath, task, model);
+      console.log("Agent execution started with run ID:", executionRunId);
+      setRunId(executionRunId);
       
       // Set up event listeners with run ID isolation
-      const outputUnlisten = await listen<string>(`agent-output:${runId}`, (event) => {
+      const outputUnlisten = await listen<string>(`agent-output:${executionRunId}`, (event) => {
         try {
           // Store raw JSONL
           setRawJsonlOutput(prev => [...prev, event.payload]);
@@ -296,12 +316,12 @@ export const AgentExecution: React.FC<AgentExecutionProps> = ({
         }
       });
 
-      const errorUnlisten = await listen<string>(`agent-error:${runId}`, (event) => {
+      const errorUnlisten = await listen<string>(`agent-error:${executionRunId}`, (event) => {
         console.error("Agent error:", event.payload);
         setError(event.payload);
       });
 
-      const completeUnlisten = await listen<boolean>(`agent-complete:${runId}`, (event) => {
+      const completeUnlisten = await listen<boolean>(`agent-complete:${executionRunId}`, (event) => {
         setIsRunning(false);
         setExecutionStartTime(null);
         if (!event.payload) {
@@ -309,7 +329,7 @@ export const AgentExecution: React.FC<AgentExecutionProps> = ({
         }
       });
 
-      const cancelUnlisten = await listen<boolean>(`agent-cancelled:${runId}`, () => {
+      const cancelUnlisten = await listen<boolean>(`agent-cancelled:${executionRunId}`, () => {
         setIsRunning(false);
         setExecutionStartTime(null);
         setError("Agent execution was cancelled");
@@ -318,16 +338,41 @@ export const AgentExecution: React.FC<AgentExecutionProps> = ({
       unlistenRefs.current = [outputUnlisten, errorUnlisten, completeUnlisten, cancelUnlisten];
     } catch (err) {
       console.error("Failed to execute agent:", err);
-      setError("Failed to execute agent");
       setIsRunning(false);
       setExecutionStartTime(null);
+      setRunId(null);
+      // Show error in messages
+      setMessages(prev => [...prev, {
+        type: "result",
+        subtype: "error",
+        is_error: true,
+        result: `Failed to execute agent: ${err instanceof Error ? err.message : 'Unknown error'}`,
+        duration_ms: 0,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0
+        }
+      }]);
     }
   };
 
   const handleStop = async () => {
     try {
-      // TODO: Implement actual stop functionality via API
-      // For now, just update the UI state
+      if (!runId) {
+        console.error("No run ID available to stop");
+        return;
+      }
+
+      // Call the API to kill the agent session
+      const success = await api.killAgentSession(runId);
+      
+      if (success) {
+        console.log(`Successfully stopped agent session ${runId}`);
+      } else {
+        console.warn(`Failed to stop agent session ${runId} - it may have already finished`);
+      }
+      
+      // Update UI state
       setIsRunning(false);
       setExecutionStartTime(null);
       
@@ -349,6 +394,22 @@ export const AgentExecution: React.FC<AgentExecutionProps> = ({
       }]);
     } catch (err) {
       console.error("Failed to stop agent:", err);
+      // Still update UI state even if the backend call failed
+      setIsRunning(false);
+      setExecutionStartTime(null);
+      
+      // Show error message
+      setMessages(prev => [...prev, {
+        type: "result",
+        subtype: "error",
+        is_error: true,
+        result: `Failed to stop execution: ${err instanceof Error ? err.message : 'Unknown error'}`,
+        duration_ms: elapsedTime * 1000,
+        usage: {
+          input_tokens: totalTokens,
+          output_tokens: 0
+        }
+      }]);
     }
   };
 
@@ -453,92 +514,47 @@ export const AgentExecution: React.FC<AgentExecutionProps> = ({
       {/* Fixed container that takes full height */}
       <div className="h-full flex flex-col">
         {/* Sticky Header */}
-        <div className="sticky top-0 z-10 bg-background border-b border-border">
+        <div className="sticky top-0 z-20 bg-background border-b border-border">
           <div className="w-full max-w-5xl mx-auto">
             <motion.div
               initial={{ opacity: 0, y: -20 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.3 }}
-              className="flex items-center justify-between p-4"
+              className="p-6"
             >
-              <div className="flex items-center space-x-3">
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={handleBackWithConfirmation}
-                  className="h-8 w-8"
-                >
-                  <ArrowLeft className="h-4 w-4" />
-                </Button>
-                <div className="flex items-center gap-2">
-                  {renderIcon()}
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <h2 className="text-lg font-semibold">{agent.name}</h2>
-                      {isRunning && (
-                        <div className="flex items-center gap-1">
-                          <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                          <span className="text-xs text-green-600 font-medium">Running</span>
-                        </div>
-                      )}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={handleBackWithConfirmation}
+                    className="h-8 w-8"
+                  >
+                    <ArrowLeft className="h-4 w-4" />
+                  </Button>
+                  <div className="flex items-center gap-3">
+                    <div className="p-2 rounded-full bg-primary/10 text-primary">
+                      {renderIcon()}
                     </div>
-                    <p className="text-xs text-muted-foreground">
-                      {isRunning ? "Click back to return to main menu - view in CC Agents > Running Sessions" : "Execute CC Agent"}
-                    </p>
+                    <div>
+                      <h1 className="text-xl font-bold">Execute: {agent.name}</h1>
+                      <p className="text-sm text-muted-foreground">
+                        {model === 'opus' ? 'Claude 4 Opus' : 'Claude 4 Sonnet'}
+                      </p>
+                    </div>
                   </div>
                 </div>
-              </div>
-              
-              <div className="flex items-center gap-2">
-                {messages.length > 0 && (
-                  <>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setIsFullscreenModalOpen(true)}
-                      className="flex items-center gap-2"
-                    >
-                      <Maximize2 className="h-4 w-4" />
-                      Fullscreen
-                    </Button>
-                    <Popover
-                      trigger={
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="flex items-center gap-2"
-                        >
-                          <Copy className="h-4 w-4" />
-                          Copy Output
-                          <ChevronDown className="h-3 w-3" />
-                        </Button>
-                      }
-                      content={
-                        <div className="w-44 p-1">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="w-full justify-start"
-                            onClick={handleCopyAsJsonl}
-                          >
-                            Copy as JSONL
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="w-full justify-start"
-                            onClick={handleCopyAsMarkdown}
-                          >
-                            Copy as Markdown
-                          </Button>
-                        </div>
-                      }
-                      open={copyPopoverOpen}
-                      onOpenChange={setCopyPopoverOpen}
-                      align="end"
-                    />
-                  </>
-                )}
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setIsFullscreenModalOpen(true)}
+                    disabled={messages.length === 0}
+                  >
+                    <Maximize2 className="h-4 w-4 mr-2" />
+                    Fullscreen
+                  </Button>
+                </div>
               </div>
             </motion.div>
           </div>
@@ -577,6 +593,15 @@ export const AgentExecution: React.FC<AgentExecutionProps> = ({
                   disabled={isRunning}
                 >
                   <FolderOpen className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={handleOpenHooksDialog}
+                  disabled={isRunning || !projectPath}
+                  title="Configure hooks"
+                >
+                  <Settings2 className="h-4 w-4 mr-2" />
+                  Hooks
                 </Button>
               </div>
             </div>
@@ -889,9 +914,56 @@ export const AgentExecution: React.FC<AgentExecutionProps> = ({
           </div>
         </div>
       )}
+
+      {/* Hooks Configuration Dialog */}
+      <Dialog 
+        open={isHooksDialogOpen} 
+        onOpenChange={setIsHooksDialogOpen}
+      >
+        <DialogContent className="max-w-4xl max-h-[80vh] overflow-hidden flex flex-col">
+          <DialogHeader>
+            <DialogTitle>Configure Hooks</DialogTitle>
+            <DialogDescription>
+              Configure hooks that run before, during, and after tool executions. Changes are saved immediately.
+            </DialogDescription>
+          </DialogHeader>
+          
+          <Tabs value={activeHooksTab} onValueChange={setActiveHooksTab} className="flex-1 flex flex-col overflow-hidden">
+            <TabsList className="grid w-full grid-cols-2">
+              <TabsTrigger value="project">Project Settings</TabsTrigger>
+              <TabsTrigger value="local">Local Settings</TabsTrigger>
+            </TabsList>
+            
+            <TabsContent value="project" className="flex-1 overflow-auto">
+              <div className="space-y-4">
+                <p className="text-sm text-muted-foreground">
+                  Project hooks are stored in <code className="bg-muted px-1 py-0.5 rounded">.claude/settings.json</code> and 
+                  are committed to version control.
+                </p>
+                <HooksEditor
+                  projectPath={projectPath}
+                  scope="project"
+                  className="border-0"
+                />
+              </div>
+            </TabsContent>
+            
+            <TabsContent value="local" className="flex-1 overflow-auto">
+              <div className="space-y-4">
+                <p className="text-sm text-muted-foreground">
+                  Local hooks are stored in <code className="bg-muted px-1 py-0.5 rounded">.claude/settings.local.json</code> and 
+                  are not committed to version control.
+                </p>
+                <HooksEditor
+                  projectPath={projectPath}
+                  scope="local"
+                  className="border-0"
+                />
+              </div>
+            </TabsContent>
+          </Tabs>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };
-
-// Import AGENT_ICONS for icon rendering
-import { AGENT_ICONS } from "./CCAgents";
