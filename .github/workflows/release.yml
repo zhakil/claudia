@@ -1,0 +1,208 @@
+name: Release Build
+
+# Trigger on tags or manual dispatch
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., v1.0.0)'
+        required: true
+        default: 'v0.1.0'
+
+# Cancel in-progress workflows when a new commit is pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  release-build:
+    name: Release Build (${{ matrix.platform.name }})
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Linux
+            os: ubuntu-latest
+            rust-target: x86_64-unknown-linux-gnu
+            file-ext: ''
+            bundle-pattern: 'bundle/deb/*.deb'
+            
+          - name: Windows
+            os: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            file-ext: '.exe'
+            bundle-pattern: 'bundle/msi/*.msi'
+            
+          - name: macOS
+            os: macos-latest
+            rust-target: x86_64-apple-darwin
+            file-ext: ''
+            bundle-pattern: 'bundle/dmg/*.dmg'
+    
+    runs-on: ${{ matrix.platform.os }}
+    
+    steps:
+      # Checkout the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Install system dependencies for Linux
+      - name: Install Linux dependencies
+        if: matrix.platform.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libglib2.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev \
+            libxdo-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      # Setup Rust with caching
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.rust-target }}
+
+      # Cache Rust dependencies
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          key: ${{ matrix.platform.os }}-rust-release-${{ hashFiles('**/Cargo.lock') }}
+          
+      # Setup Bun
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Cache Bun dependencies
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun
+            node_modules
+          key: ${{ matrix.platform.os }}-bun-release-${{ hashFiles('bun.lockb', 'package.json') }}
+          restore-keys: |
+            ${{ matrix.platform.os }}-bun-
+      
+      # Install frontend dependencies
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      # Build Tauri application with bundles
+      - name: Build Tauri application
+        run: bun run tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ""
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+
+      # Upload binary (executable)
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: claudia-${{ matrix.platform.name }}-binary
+          path: src-tauri/target/release/claudia${{ matrix.platform.file-ext }}
+          retention-days: 30
+
+      # Upload installation packages
+      - name: Upload installation packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: claudia-${{ matrix.platform.name }}-installer
+          path: src-tauri/target/release/${{ matrix.platform.bundle-pattern }}
+          retention-days: 30
+
+      # Upload all bundle artifacts for debugging
+      - name: Upload all bundles (debug)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claudia-${{ matrix.platform.name }}-all-bundles
+          path: src-tauri/target/release/bundle/
+          retention-days: 7
+
+  # Create GitHub Release
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [release-build]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Download all artifacts
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      # Create release
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: Claudia ${{ github.event.inputs.version || github.ref_name }}
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            ./artifacts/claudia-Linux-installer/*.deb
+            ./artifacts/claudia-Windows-installer/*.msi
+            ./artifacts/claudia-macOS-installer/*.dmg
+            ./artifacts/claudia-Linux-binary/claudia
+            ./artifacts/claudia-Windows-binary/claudia.exe
+            ./artifacts/claudia-macOS-binary/claudia
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Summary job
+  release-summary:
+    name: Release Summary
+    runs-on: ubuntu-latest
+    needs: [release-build, create-release]
+    if: always()
+    
+    steps:
+      - name: Check release results
+        run: |
+          build_result="${{ needs.release-build.result }}"
+          release_result="${{ needs.create-release.result }}"
+          
+          echo "## 📦 Release Build Summary"
+          echo ""
+          echo "| Job | Status |"
+          echo "|-----|--------|"
+          echo "| Build | $([[ "$build_result" == "success" ]] && echo "✅ Success" || echo "❌ Failed") |"
+          echo "| Release | $([[ "$release_result" == "success" ]] && echo "✅ Success" || echo "❌ Failed") |"
+          echo ""
+          
+          if [[ "$build_result" == "failure" ]] || [[ "$release_result" == "failure" ]]; then
+            echo "❌ Release failed"
+            exit 1
+          elif [[ "$build_result" == "cancelled" ]] || [[ "$release_result" == "cancelled" ]]; then
+            echo "⚠️ Release was cancelled"
+            exit 1
+          else
+            echo "✅ Release completed successfully"
+          fi
